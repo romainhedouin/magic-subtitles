@@ -53,8 +53,8 @@ Three outcomes, and the user should understand the trade:
 
 - **No (default)** — just the `.srt` file. Players load it automatically when
   it sits beside the video with a matching filename.
-- **Soft-mux** — remux the subtitle track into the container. Instant, lossless,
-  toggleable in the player. Almost always what people actually want.
+- **Soft-mux** — remux the subtitle track into the container. Fast, picture
+  untouched, toggleable in the player. Almost always what people actually want.
 - **Hard burn (pixel-embed)** — subtitles painted into the picture. Requires a
   full video re-encode: slow (1–3× realtime), lossy, permanent, and the file
   cannot be turned off. Only do this if the target device can't handle subtitle
@@ -470,10 +470,25 @@ Movie.Name.2024.1080p.mkv
 Movie.Name.2024.1080p.fr.srt
 ```
 
-Soft-mux (instant, lossless, toggleable):
+### Required: every video this skill writes carries AAC-LC stereo audio
+
+Most releases ship **AC3 or E-AC3 5.1**. Android TV and Chromecast will not play
+it — the picture arrives and the sound is silent, with nothing in the ffmpeg
+output to warn you. Convert the audio. Never `-c:a copy` into a delivered video.
 
 ```bash
-ffmpeg -y -i "$MOVIE" -i final.srt -map 0 -map 1 -c copy \
+-c:a aac -profile:a aac_low -b:a 192k -ac 2
+```
+
+Keep the source sample rate (48 kHz for essentially every film). Resampling to
+44.1 kHz buys no compatibility and only loses quality. If a device still refuses
+the track, try the **MP4 container** next, not a different sample rate.
+
+Soft-mux (picture untouched, subtitles toggleable):
+
+```bash
+ffmpeg -y -i "$MOVIE" -i final.srt -map 0:v:0 -map 0:a:0 -map 1 \
+  -c:v copy -c:a aac -profile:a aac_low -b:a 192k -ac 2 \
   -c:s srt -metadata:s:s:0 language=fra "output.mkv"
 ```
 
@@ -481,7 +496,26 @@ Hard burn (only if the user explicitly chose it — slow, lossy, permanent):
 
 ```bash
 ffmpeg -y -i "$MOVIE" -vf "subtitles=final.srt:force_style='FontSize=24'" \
-  -c:v libx264 -crf 18 -preset medium -c:a copy "output-burned.mkv"
+  -map 0:v:0 -map 0:a:0 \
+  -c:v libx264 -crf 18 -preset medium \
+  -c:a aac -profile:a aac_low -b:a 192k -ac 2 "output-burned.mkv"
+```
+
+To fix the audio on a video that is otherwise already finished, **do not
+re-encode the picture.** Stream-copy the video and convert only the audio —
+under a minute for a feature film, and the video stays bit-identical:
+
+```bash
+ffmpeg -y -i "in.mkv" -map 0:v:0 -map 0:a:0 \
+  -c:v copy -c:a aac -profile:a aac_low -b:a 192k -ac 2 "out.mkv"
+```
+
+Verify before handing it over:
+
+```bash
+ffprobe -v error -select_streams a:0 \
+  -show_entries stream=codec_name,profile,channels,sample_rate -of csv=p=0 out.mkv
+# expect: aac,LC,2,48000
 ```
 
 Never overwrite the user's original. Write a new file.
@@ -500,6 +534,13 @@ default) and enable VAD. Always check for repeated lines:
 `grep -vE '^[0-9]+$|-->|^$' out.srt | sort | uniq -c | sort -rn | head`
 
 **OOM on long audio.** See Step 5. Chunk it.
+
+**AC3 5.1 audio casts as silence.** The file plays perfectly on the desktop, so
+it reads as a device fault rather than a file fault, and ffmpeg emits no warning.
+Android TV and Chromecast simply drop the track: picture, no sound. Deliver
+AAC-LC stereo (Step 10). When a user reports missing audio on a TV, probe the
+codec *before* investigating anything else — and fix it by stream-copying the
+video, not by re-encoding it.
 
 **Masked exit codes.** A background wrapper can report success while the real
 process was killed. Verify the output file exists and is non-empty.
