@@ -47,6 +47,9 @@ def main():
     lo, hi = cfg.get('drop_cues_between', [None, None])
     foreign = FOREIGN.get(cfg.get('drop_if_foreign'), set())
     threshold = cfg.get('drop_threshold', 0.34)
+    # Regexes for cues to delete outright -- typically ASR boilerplate
+    # hallucinations ("Sous-titrage ...", "Merci d'avoir regardé").
+    drop_matching = [re.compile(p, re.I) for p in cfg.get('drop_matching', [])]
 
     blocks = re.split(r'\n\s*\n', open(src, encoding='utf-8').read().strip())
     kept, dropped, nfix = [], [], 0
@@ -57,6 +60,10 @@ def main():
             continue
         timing, text = ls[1], '\n'.join(ls[2:])
         start = to_sec(timing.split('-->')[0].strip())
+
+        if any(p.search(text) for p in drop_matching):
+            dropped.append((timing, text))
+            continue
 
         if foreign and lo is not None and lo <= start <= hi:
             words = [w.lower() for w in re.findall(r"[A-Za-zÀ-ÿ']+", text)]

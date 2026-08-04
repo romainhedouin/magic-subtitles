@@ -64,7 +64,30 @@ Steer toward soft-mux if the user asks for burn-in without a specific reason.
 
 ---
 
-## Step 1 — Probe the file
+## Step 1 — Gather context about the film
+
+Do this **early**, before transcribing. You will need it constantly in Step 8.
+
+Identify the film (filename, year, release tag) and pull together:
+
+- a **detailed plot synopsis** — scene by scene if available
+- the **character list with correct name spellings**, and the dub-language
+  spellings if they differ
+- place names, factions, invented terminology
+
+Use WebSearch/WebFetch for a synopsis and cast list. This is ordinary factual
+lookup and is not the same as scraping a full transcript.
+
+Why it matters: ASR errors are usually *plausible-sounding* words. Only context
+tells you that `les uns` should be `les Huns`, that `défaire Léa` should be
+`défaire les Huns`, or that a garbled name is a character. Without the synopsis
+you will only catch errors a dictionary flags — which is a small fraction of
+them.
+
+Write the names and terms into a working glossary. Every one is a term Whisper
+will get wrong repeatedly and consistently.
+
+## Step 2 — Probe the file
 
 ```bash
 ffprobe -v error -show_entries stream=index,codec_type,codec_name,channels:stream_tags=language,title \
@@ -84,7 +107,7 @@ Running out mid-run corrupts outputs in confusing ways.
 
 ---
 
-## Step 2 — Extract the audio
+## Step 3 — Extract the audio
 
 For a **5.1** track, take the **centre channel only** — dialogue is mixed there,
 while score and effects sit in L/R/surrounds. This is free separation and it
@@ -116,7 +139,7 @@ cares about song lyrics, and then only on those passages.
 
 ---
 
-## Step 3 — Get the reference transcript
+## Step 4 — Get the reference transcript
 
 This is the step that makes the result reliable. **Do not skip it.**
 
@@ -124,7 +147,7 @@ The reference must be a genuine transcript in the **dub language**, not a
 translation of the English script. A subtitle track from the release itself
 qualifies; a machine translation of the original screenplay does not.
 
-### 3a. Preferred: a subtitle track inside the movie file
+### 4a. Preferred: a subtitle track inside the movie file
 
 Text-based — extract directly:
 
@@ -144,18 +167,35 @@ OCR is good but not perfect. `fix_ocr.py` handles the systematic errors, and
 `scripts/verify_ocr.py` lists remaining suspects. **Verify suspicious words
 against the source bitmap before "fixing" them** — see Pitfalls.
 
-### 3b. Fallback: ask the user
+### 4b. Optional: a supplementary reference found online
 
-If the file has no subtitle track in the target language, ask the user to supply
-a reference subtitle file for this release. A `.srt` they already have works
-fine.
+A second reference is a bonus, not a requirement. If you can find a transcript
+or subtitle file **in the dub language** for this film, use it alongside the
+in-file track — a second opinion resolves cases where the first reference is
+too divergent to judge, especially proper nouns.
 
-Do **not** scrape a full screenplay or transcript from a script website.
-Reproducing a film's complete dialogue from a third-party source is a copyright
-problem, and it is also technically worse: those texts are untimed, often
-transcribe the *original* language rather than the dub, and frequently come from
-a different cut of the film. The in-file track is timecoded to this exact
-release, which is precisely what makes it useful.
+Two rules:
+
+- It must be **dub-language**. A transcript of the original-language script,
+  or a machine translation of one, is worse than useless: it will confidently
+  disagree with the dub everywhere and generate false corrections.
+- Use it to **verify and adjudicate**, never to bulk-replace the transcript.
+  Do not copy a full screenplay into the output file; quote only what you need
+  to settle a specific word.
+
+**If you cannot find one, that is fine — carry on.** The in-file track plus the
+Step 1 synopsis is enough. Just expect a slightly longer manual-review table at
+the end, and say so.
+
+### 4c. Fallback: ask the user
+
+If the file has no subtitle track in the target language and you found nothing
+online, ask the user to supply a reference subtitle file for this release. A
+`.srt` they already have works fine.
+
+If there is no reference at all, you can still transcribe — but say clearly that
+verification was limited to the synopsis, grammar and internal consistency, and
+expect materially more errors to survive.
 
 ### An important caveat to tell the user
 
@@ -170,7 +210,7 @@ voices; that is the whole point.
 
 ---
 
-## Step 4 — Transcribe with WhisperX, in chunks
+## Step 5 — Transcribe with WhisperX, in chunks
 
 ```bash
 uv venv --python 3.12 .venv && source .venv/bin/activate
@@ -203,7 +243,7 @@ Run it in the background and monitor completions rather than blocking.
 
 ---
 
-## Step 5 — Recover word-level timings
+## Step 6 — Recover word-level timings
 
 WhisperX aligns to word level internally but **throws that away** when writing
 SRT, leaving whisper's coarse segment boundaries. Recover it with an
@@ -215,7 +255,7 @@ python3 scripts/align_words.py work/chunks work/srt work/words.json fr
 
 ---
 
-## Step 6 — Build the subtitle file
+## Step 7 — Build the subtitle file
 
 ```bash
 python3 scripts/build_srt.py work/words.json work/chunks/cuts.txt draft.srt fr
@@ -231,54 +271,118 @@ does not. `build_srt.py` takes the language code for this reason.
 
 ---
 
-## Step 7 — Correct the transcript against the reference
+## Step 8 — Correct the transcript, line by line
 
-Find candidate errors, then adjudicate each against the reference at the same
-timecode.
+This is the step that separates a usable file from a rough one. **A dictionary
+check alone is not enough** — it only catches errors that spell as non-words.
+Most ASR errors are perfectly valid words in the wrong place: `les uns` for
+`les Huns`, `Meuf` for `Bœuf`, `la passe` for `la face`. Every one of those
+passes a spell-check cleanly.
+
+So run three passes, in this order.
+
+### Pass A — dictionary sweep (cheap, catches the obvious)
 
 ```bash
-# 1. surface suspects: words no dictionary recognises
-python3 scripts/find_suspects.py draft.srt fr
-
-# 2. for each suspect, show the reference text at that timecode
+python3 scripts/find_suspects.py draft.srt fr --foreign en
 python3 scripts/adjudicate.py draft.srt reference.srt fr WORD1 WORD2 ...
 ```
 
-Expect three error classes:
+### Pass B — contextual line-by-line read (mandatory, catches the rest)
 
-**Proper-noun instability** — the same character spelled many ways across the
-film. The reference gives you the canonical spelling. This is the highest-value
-fix: names recur constantly, so each correction pays off many times.
+Read **every cue** against the reference at the same timecode. Do not skip this
+and do not sample it. Work in batches of 100–150 cues so each batch fits
+comfortably in context:
 
-**Misheard common words** — a real word mangled phonetically. The reference at
-the same second usually makes it obvious (`grinderie` → `grain de riz`,
-`l'obligence` → `l'obligeance`).
+```bash
+python3 scripts/review_pairs.py draft.srt reference.srt 1 150
+python3 scripts/review_pairs.py draft.srt reference.srt 151 300
+# ... continue to the end
+```
 
-**Foreign-language contamination** — usually an end-credits song in the original
-language. Drop those cues; they are not dialogue.
+For each cue ask:
 
-Then apply the fixes:
+1. **Does it make sense** in this scene, given the synopsis from Step 1?
+2. **Does it match the reference's meaning**, even if the wording differs?
+3. **Is a proper noun involved?** Check it against the Step 1 glossary.
+4. **Is it grammatical French/English?** Agreement errors betray misheard words
+   (`Mulan est parti` for a female character; `Fa Zhou sera humiliée` for a male
+   one).
+5. **Would a viewer stumble on it?** If it reads as nonsense, it is nonsense.
+
+Typical catches that only this pass finds:
+
+| Whisper heard | Actually | How you know |
+|---|---|---|
+| `les uns` | `les Huns` | Synopsis: the Huns are the antagonists |
+| `Meuf, porc, poulet` | `Bœuf, porc, poulet` | A food list — `Meuf` is nonsense here |
+| `défaire Léa` | `défaire les Huns` | No character named Léa exists |
+| `je ne perdrai pas la passe` | `... la face` | Fixed idiom |
+| `Salut, chienne peau` | `Salut, Chien-Po` | Glossary name, spelled phonetically |
+| `Jésus-Bren` | `Je suis prêt` | Meaningless; reference gives the sense |
+
+Beware the inverse: `quelques-uns` is correct and must **not** be swept up by a
+blanket `uns → Huns` replacement. Always anchor replacements to enough
+surrounding words to be unambiguous.
+
+### Pass C — hallucination sweep
+
+Whisper emits boilerplate from its training data, especially over silence and
+end credits. Always check:
+
+```bash
+grep -inE "sous-titrage|subtitle|amara|merci d'avoir regardé|thanks for watching|abonnez-vous" draft.srt
+grep -vE '^[0-9]+$|-->|^$' draft.srt | sort | uniq -c | sort -rn | head
+```
+
+Any subtitling-house credit, "thanks for watching", or line repeated many times
+is a hallucination. Drop it via `drop_matching` in the fixes file.
+
+### Applying
 
 ```bash
 python3 scripts/apply_fixes.py draft.srt final.srt fixes.json
 ```
 
-`apply_fixes.py` **rewrites only text lines and never touches timestamps.**
-It verifies this itself and reports any timing line that changed.
+`apply_fixes.py` **rewrites only text lines and never touches timestamps.** It
+asserts this itself and reports any timing line that changed, plus every cue it
+dropped.
+
+If a replacement lengthens a line past 42 characters, re-wrap it — that changes
+line breaks only, never timings.
 
 ### Judgement rules
 
-- **Only fix what the reference confirms.** If the two translations diverge too
-  far to tell what was said, leave the word alone. A wrong word the user can
-  spot beats a confident-sounding invention they cannot audit.
-- **List what you left alone** in your final report so the user can check those
-  spots themselves.
-- Musical numbers are where the translations diverge most, so that is where you
-  will resolve the least. Expect it.
+- **Only fix what you can justify** from the reference, the synopsis, or a fixed
+  idiom. If the translations diverge too far to tell, leave the word alone. A
+  wrong word the user can spot beats a confident-sounding invention they cannot
+  audit.
+- Musical numbers diverge most between dub and subtitle translations, so that is
+  where you will resolve least. Expect it.
+
+### Hand the remainder to the user
+
+Whatever you could not resolve, present as a table so the user can check it
+against the audio in one pass. Always these four columns:
+
+| Time | Whisper heard | Transcript says | Context |
+|---|---|---|---|
+| 00:28:05 | `un vrai purson` | *Torride, non ?* | Mushu boasting after a fire trick |
+| 00:46:38 | `Kenny ! McKay !` | *Gengis Khanasson...* | Mushu naming the horse; likely a joke name |
+| 00:56:13 | `Monkey !` | *(no reference cue)* | Shouted during the battle |
+
+Sort by timestamp so the user can work through the film linearly. Give the
+timestamp in `HH:MM:SS` so it can be typed straight into a player. In
+**Context**, say what is happening in the scene — that is usually what lets the
+user recognise the line without hunting for it.
+
+Group by ease: short isolated shouts first, mid-sentence errors next, sung lines
+last. Flag anything you believe is probably *correct* (real slang, a deliberate
+dub invention) so the user does not waste time on it.
 
 ---
 
-## Step 8 — QA
+## Step 9 — QA
 
 ```bash
 python3 scripts/qa_srt.py final.srt reference.srt
@@ -297,7 +401,7 @@ worth confirming rather than assuming.
 
 ---
 
-## Step 9 — Deliver
+## Step 10 — Deliver
 
 Name the file to match the video so players auto-load it:
 
@@ -335,7 +439,7 @@ context (`-mc 0` in whisper.cpp, and WhisperX does not carry context by
 default) and enable VAD. Always check for repeated lines:
 `grep -vE '^[0-9]+$|-->|^$' out.srt | sort | uniq -c | sort -rn | head`
 
-**OOM on long audio.** See Step 4. Chunk it.
+**OOM on long audio.** See Step 5. Chunk it.
 
 **Masked exit codes.** A background wrapper can report success while the real
 process was killed. Verify the output file exists and is non-empty.
@@ -379,6 +483,7 @@ All under `scripts/`, all take explicit arguments, none hardcode paths.
 | `align_words.py` | Alignment-only pass for word-level timings |
 | `build_srt.py` | Rebuild cues with real subtitle constraints |
 | `find_suspects.py` | Dictionary check to surface candidate errors |
+| `review_pairs.py` | Side-by-side draft vs reference for line-by-line review |
 | `adjudicate.py` | Show reference text at a suspect's timecode |
 | `apply_fixes.py` | Apply text fixes; asserts timings unchanged |
 | `qa_srt.py` | Structural, readability and coverage QA |
