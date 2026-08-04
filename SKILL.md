@@ -33,13 +33,24 @@ Metal backend, so the GPU is not used). With CUDA, divide by roughly 10.
 
 | Model | Time | Notes |
 |---|---|---|
-| `large-v3` | **1–2 h** | Best accuracy. Recommended default. |
-| `large-v3-turbo` | **20–40 min** | Distilled decoder. Noticeably worse on proper nouns and rare words. |
-| `medium` | **20–40 min** | Weaker again; expect more name errors. |
-| `small` | **10–20 min** | Draft quality only. |
+| `large-v3` | **1–2 h** | Best accuracy. **Use this.** |
+| `large-v3-turbo` | 20–40 min | Distilled decoder. Measurably worse on names and rare words. |
+| `medium` | 20–40 min | Weaker again. |
+| `small` | 10–20 min | Draft quality only. |
 
-Recommend `large-v3` unless the user is time-constrained. The quality gap is
-real and concentrated exactly where it hurts: names and unusual vocabulary.
+**Do not reach for `turbo` to save time.** It is a distilled decoder, and the
+accuracy it gives up lands precisely on the words that matter most — proper
+nouns and rare vocabulary — which are also the hardest for a human to spot and
+fix afterwards. Measured on the reference run, same audio, same settings:
+
+| | large-v3-turbo | large-v3 |
+|---|---|---|
+| "the Huns crossed the border" | `les eux` | `les Huns` (correct) |
+
+Every hour `turbo` saves is repaid several times over in manual review, because
+each surviving name error recurs throughout the film. Offer the faster models
+only if the user explicitly accepts a rougher result, and say plainly that the
+review burden grows.
 
 ### Q2. Which language is the audio in?
 
@@ -66,7 +77,10 @@ Steer toward soft-mux if the user asks for burn-in without a specific reason.
 
 ## Step 1 — Gather context about the film
 
-Do this **early**, before transcribing. You will need it constantly in Step 8.
+**This step is vital. Do not skip it, and do it before transcribing.** Nearly
+every correction in Step 8 depends on knowing what the film is about. Without
+it you will catch only the errors a dictionary flags, which is a small minority
+of them.
 
 Identify the film (filename, year, release tag) and pull together:
 
@@ -169,10 +183,21 @@ against the source bitmap before "fixing" them** — see Pitfalls.
 
 ### 4b. Optional: a supplementary reference found online
 
-A second reference is a bonus, not a requirement. If you can find a transcript
-or subtitle file **in the dub language** for this film, use it alongside the
-in-file track — a second opinion resolves cases where the first reference is
-too divergent to judge, especially proper nouns.
+**Optional, but very valuable when you find one — spend real effort looking.**
+If you can find a transcript or subtitle file **in the dub language** for this
+film, use it alongside the in-file track. A second reference resolves cases
+where the first is too divergent to judge, which is the single biggest cause of
+errors that survive to the end.
+
+Best target: a **SDH / "sourds et malentendants" / hearing-impaired** subtitle
+track. Unlike an ordinary subtitle translation, SDH transcribes the *dub audio*
+itself, so it matches what the voices say almost word for word. That is the one
+artefact that would resolve nearly everything a normal reference cannot. Search
+for it explicitly.
+
+Ordinary subtitle files in the dub language are much weaker: they are another
+independent translation, so they diverge from the dub in the same places the
+first reference does, and add less than you would expect.
 
 Two rules:
 
@@ -292,7 +317,17 @@ Most ASR errors are perfectly valid words in the wrong place: `les uns` for
 `les Huns`, `Meuf` for `Bœuf`, `la passe` for `la face`. Every one of those
 passes a spell-check cleanly.
 
-So run three passes, in this order.
+**The governing principle: the reference is a reliable error *detector* and an
+unreliable error *corrector*.** It tells you a line is wrong far more often than
+it tells you what is right, because it is a different translation. When the
+reference shows the line is wrong but not what it should be, that is not a
+failure — that is the normal case, and it belongs in the user-review table.
+
+Real example: the reference read *Petite maladroite*, the ASR had
+`Petit en petit`. Enough to prove the line was broken; not enough to recover
+`Petite empotée`, which only the audio gave.
+
+So run these passes, in this order.
 
 ### Pass A — dictionary sweep (cheap, catches the obvious)
 
@@ -322,6 +357,11 @@ For each cue ask:
    (`Mulan est parti` for a female character; `Fa Zhou sera humiliée` for a male
    one).
 5. **Would a viewer stumble on it?** If it reads as nonsense, it is nonsense.
+6. **Does it join up with the next cue?** Sentences routinely span a cue
+   boundary, and an error next to the split looks fine in isolation. Read
+   consecutive cues joined together, not only one at a time. A cue ending
+   `...qui va changer` reads acceptably alone; followed by
+   `aucun doute leur sauter aux yeux !` it is plainly `qui va sans`.
 
 Typical catches that only this pass finds:
 
@@ -372,6 +412,31 @@ line breaks only, never timings.
   audit.
 - Musical numbers diverge most between dub and subtitle translations, so that is
   where you will resolve least. Expect it.
+
+### On running several models for "multiple sources"
+
+Tempting, and mostly measured *not* to work. Record before repeating it:
+
+- **Two Whisper variants are not independent.** They share weights and training
+  data, so they reproduce each other's errors. Confirmed directly: whisper.cpp
+  `large-v3` independently produced `Chifou` — the same error the CTranslate2
+  `large-v3` run made, which had already been corrected. A second Whisper pass
+  will confidently agree with the first that `les Huns` is `les uns`.
+- **A different architecture is genuinely independent but weak.** The wav2vec2
+  CTC pass (Pass D) is architecturally unrelated, and still found 0 new errors.
+- **Do not run them concurrently on CPU.** CTranslate2 already saturates the
+  cores; three parallel runs are roughly three times slower each, with no
+  wall-clock gain. Run sequentially, or in parallel only with a GPU.
+
+What remains untested, and is the version worth trying if you want to revisit
+this: a **three-way vote** across genuinely diverse *and* individually strong
+systems — e.g. `large-v3`, a French-fine-tuned Whisper, and a CTC model — taking
+majority agreement rather than pairwise disagreement. Two-way comparison against
+a weak second system is what failed here; that is a narrower result than "model
+diversity doesn't help".
+
+Spend the effort on Step 1 (synopsis) and Pass B (line-by-line) first. Both
+were measured to catch far more, for far less compute.
 
 ### Pass D — independent ASR cross-check (optional, measured low-yield)
 
@@ -439,6 +504,19 @@ user recognise the line without hunting for it.
 Group by ease: short isolated shouts first, mid-sentence errors next, sung lines
 last. Flag anything you believe is probably *correct* (real slang, a deliberate
 dub invention) so the user does not waste time on it.
+
+### The endgame is the user, and that is fine
+
+Once the reference, the dictionary and the synopsis are exhausted, the remaining
+errors are the ones where the dub says something no other text records. On the
+reference run **every correction after that point came from the user listening**
+— `pur-sang`, `rufian`, `blanc-bec`, `Petite empotée`, `porc aigre doux`. None
+were recoverable from any reference.
+
+Do not treat that as a shortfall to hide or grind against with more compute.
+Deliver a short, well-ordered review table and say plainly that these need ears.
+A precise 10-line table is worth more to the user than another hour of
+processing that finds nothing.
 
 ---
 
