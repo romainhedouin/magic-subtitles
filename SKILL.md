@@ -12,6 +12,13 @@ The naive approach — run Whisper, write the SRT — fails in three predictable
 ways: timings drift by seconds, proper nouns are mangled, and long runs of
 audio collapse into unreadable blocks. This skill fixes all three.
 
+**About the examples in this document.** Worked examples throughout come from
+one reference run — a French-dubbed 1998 animated feature — and are written as
+`what the ASR produced` → `what it should be` → *how that was determined*. They
+illustrate the *shape* of each problem, not facts about that film. Expect the
+same shapes in any film and language: invented names, homophone swaps, a fixed
+idiom broken, an insult heard as a proper noun.
+
 The core idea: **transcribe with WhisperX, then correct the transcript against
 a reference subtitle track already inside the movie file.** Almost every video
 release ships subtitles in the dub language. That track is a real human
@@ -93,8 +100,9 @@ Use WebSearch/WebFetch for a synopsis and cast list. This is ordinary factual
 lookup and is not the same as scraping a full transcript.
 
 Why it matters: ASR errors are usually *plausible-sounding* words. Only context
-tells you that `les uns` should be `les Huns`, that `défaire Léa` should be
-`défaire les Huns`, or that a garbled name is a character. Without the synopsis
+tells you that `les uns` is really `les Huns` (a homophone, and the synopsis
+names the Huns as the antagonists), or that `défaire Léa` is `défaire les Huns`
+(the ASR invented a person; the character list has no such name). Without the synopsis
 you will only catch errors a dictionary flags — which is a small fraction of
 them.
 
@@ -419,8 +427,9 @@ Tempting, and mostly measured *not* to work. Record before repeating it:
 
 - **Two Whisper variants are not independent.** They share weights and training
   data, so they reproduce each other's errors. Confirmed directly: whisper.cpp
-  `large-v3` independently produced `Chifou` — the same error the CTranslate2
-  `large-v3` run made, which had already been corrected. A second Whisper pass
+  `large-v3` independently produced `Chifou` for a character named `Chi Fu` —
+  the identical error the CTranslate2 `large-v3` run made, which had already
+  been corrected by hand. A second Whisper pass
   will confidently agree with the first that `les Huns` is `les uns`.
 - **A different architecture is genuinely independent but weak.** The wav2vec2
   CTC pass (Pass D) is architecturally unrelated, and still found 0 new errors.
@@ -473,8 +482,8 @@ Do not run this expecting results. It is kept because it is cheap (~7 min for a
 decoding) and might do better with a stronger second model — a French-fine-tuned
 Whisper, or a genuinely different family. **A second Whisper run is not a
 substitute**: same weights reproduce the same errors, which was confirmed here
-when whisper.cpp large-v3 independently produced `Chifou`, an error the first
-pass had made too.
+when whisper.cpp large-v3 independently produced `Chifou` for the character
+`Chi Fu` — the identical error the first pass had made.
 
 ### Validate any detector before you trust it
 
@@ -509,9 +518,21 @@ dub invention) so the user does not waste time on it.
 
 Once the reference, the dictionary and the synopsis are exhausted, the remaining
 errors are the ones where the dub says something no other text records. On the
-reference run **every correction after that point came from the user listening**
-— `pur-sang`, `rufian`, `blanc-bec`, `Petite empotée`, `porc aigre doux`. None
-were recoverable from any reference.
+reference run **every correction after that point came from the user listening.**
+The pattern to recognise — in each case the reference proved the line was wrong
+and could not say what was right, because it was a different translation:
+
+| ASR produced | Actually said | Reference said | Why it was stuck |
+|---|---|---|---|
+| `purson` (non-word) | `pur-sang` | *Torride, non ?* | Reference paraphrased the joke entirely |
+| `refiant` (non-word) | `rufian` | *Canailles insubordonnées !* | Same insult, different word |
+| `Blorbeck` | `blanc-bec` | *vermisseau !* | An insult misheard as a name |
+| `Petit en petit` | `Petite empotée` | *Petite maladroite !* | Synonym, not the same word |
+| garbled clause | `porc aigre doux` | *nouille molle !* | Dub invents its own insult |
+
+Note that none of these are exotic. Each is a common class: a real word heard as
+a non-word, an insult heard as a name, a synonym in the reference. Expect them
+in any film.
 
 Do not treat that as a shortfall to hide or grind against with more compute.
 Deliver a short, well-ordered review table and say plainly that these need ears.
@@ -680,6 +701,32 @@ All under `scripts/`, all take explicit arguments, none hardcode paths.
 | `adjudicate.py` | Show reference text at a suspect's timecode |
 | `apply_fixes.py` | Apply text fixes; asserts timings unchanged |
 | `qa_srt.py` | Structural, readability and coverage QA |
+
+## Adapting to another language
+
+The pipeline is language-generic, but the language appears in several places and
+a mismatch fails quietly rather than loudly. Change all of these together:
+
+| Where | French | English | Note |
+|---|---|---|---|
+| `whisperx --language` | `fr` | `en` | ISO-639-1 |
+| `tesseract -l` (OCR) | `fra` | `eng` | ISO-639-2; needs `tesseract-lang` |
+| `hunspell -d` | `fr` | `en_US` | dictionary must be installed |
+| `align_words.py` | `fr` | `en` | picks the wav2vec2 alignment model |
+| `asr_ctc.py` model id | `...xlsr-53-french` | `...xlsr-53-english` | optional Pass D |
+| `build_srt.py` / `fix_ocr.py` | `fr` | `en` | punctuation spacing |
+
+Two things that are genuinely language-specific, not just a code:
+
+- **Punctuation spacing.** French puts a space before `! ? ; :`; English does
+  not. `SPACE_BEFORE` in `build_srt.py` and `fix_ocr.py` holds the set of
+  languages that do — add yours if needed.
+- **The stopword and determiner lists** in `cross_check.py` and any
+  sentence-boundary logic are French. For another language, replace them or the
+  heuristics will misfire. They are small and self-contained.
+
+Everything else — chunking, alignment, cue building, the QA checks — is
+language-neutral.
 
 ## Dependencies
 
