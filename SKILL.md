@@ -80,6 +80,11 @@ Three outcomes, and the user should understand the trade:
 
 Steer toward soft-mux if the user asks for burn-in without a specific reason.
 
+These three are the *minimum*. Ask more whenever an answer would change the
+plan — see "Asking the user is expected, not a fallback" in Step 8. Checking
+before a 1–2 hour transcription costs the user a moment; discovering the wrong
+assumption afterwards costs both of you the run.
+
 ---
 
 ## Step 1 — Gather context about the film
@@ -229,6 +234,10 @@ online, ask the user to supply a reference subtitle file for this release. A
 If there is no reference at all, you can still transcribe — but say clearly that
 verification was limited to the synopsis, grammar and internal consistency, and
 expect materially more errors to survive.
+
+**Ask this before transcribing, not after.** It is the single decision that most
+changes the quality of the result, and the user may have a suitable file to hand.
+Discovering it after a 1–2 hour run wastes the verification stage entirely.
 
 ### An important caveat to tell the user
 
@@ -493,6 +502,41 @@ finds and how highly it ranks them. This turns "seems useful" into a number,
 and it is the only thing that separates a real check from a plausible-looking
 list. It cost one command here and prevented shipping a 234-cue list of noise
 as though it were diligence.
+
+### Asking the user is expected, not a fallback
+
+**A question is cheaper than a wrong guess, and cheaper than an hour of compute
+that finds nothing.** The user has the audio and can settle in thirty seconds
+what no amount of processing will resolve. Treat that as the design of the
+process, not an admission of failure.
+
+Concretely:
+
+- **Never invent a word to avoid asking.** A confident-looking wrong line is
+  worse than a flagged one, because the user will not think to check it. If the
+  evidence does not decide it, it goes in the table.
+- **Never run more compute purely to avoid asking.** On the reference run an
+  extra cross-check pass cost ~30 minutes and found nothing that four listening
+  questions had not already settled. If the next useful step is a listen, ask.
+- **Ask early when the answer changes the plan**, not only at the end:
+  - no reference track in the file → ask *before* the 1–2 h transcription, since
+    the user may have a subtitle file that changes the whole verification stage
+  - the user reports vague "imperfections" → ask whether they mean wrong words,
+    timing, or line breaks; these have entirely different fixes
+  - low disk space, or a model choice that trades hours against accuracy
+- **Expect several rounds, and say so.** The loop that works is: hand over a
+  table → the user answers a few → apply them → the answers often reveal
+  adjacent errors → hand over a smaller table. On the reference run this ran
+  four times and produced the last dozen corrections. Do not present the first
+  table as final.
+- **Batch the questions.** One consolidated table the user can work through
+  linearly, not a question every few minutes.
+- **Make answering cheap.** Give a timestamp they can type into a player, quote
+  what the ASR heard, and say what is happening in the scene. If a whole line is
+  garbled, ask for the whole line rather than one word.
+- **Apply answers verbatim.** The user heard the audio; you did not. If their
+  wording implies an adjacent cue is also wrong, say so and ask — do not silently
+  extend the fix.
 
 ### Hand the remainder to the user
 
