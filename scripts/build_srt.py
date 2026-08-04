@@ -54,6 +54,18 @@ def group(words):
     return cues
 
 
+def starts_sentence(prev, word):
+    """True if `word` looks like the start of a new sentence mid-line.
+
+    Whisper capitalises sentence starts, but regrouping words into cues can
+    leave that capital stranded mid-line with no punctuation ("...qui es-tu Je
+    suis un ami"). Breaking the line there reads far better.
+    """
+    return (re.match(r'^[A-ZÀ-Ý][a-zà-ÿ]', word)
+            and re.search(r'[a-zà-ÿ]$', prev)        # previous word ended mid-sentence
+            and not re.search(r'[.!?:…]$', prev))
+
+
 def wrap(text):
     if len(text) <= MAX_LINE:
         return text
@@ -66,6 +78,8 @@ def wrap(text):
         cost = abs(len(a) - len(b))
         if re.search(r'[,.!?;:]$', words[i - 1]):
             cost -= 12                          # prefer breaking after punctuation
+        if starts_sentence(words[i - 1], words[i]):
+            cost -= 20                          # prefer breaking before a new sentence
         if cost < best_cost:
             best, best_cost = (a, b), cost
     if best:

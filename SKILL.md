@@ -269,6 +269,19 @@ reading speed under 20 CPS, and guarantees no overlap.
 Language-aware punctuation: French requires a space before `! ? ; :`, English
 does not. `build_srt.py` takes the language code for this reason.
 
+Line breaks prefer sentence boundaries. Regrouping words into cues can strand a
+capitalised sentence start mid-line with no punctuation ("...qui es-tu Je suis
+un ami"), which reads badly. `build_srt.py` weights the break point to fall
+there. It cannot fix every case -- a cue that is already two full lines has
+nowhere to put a third -- so check the output for leftovers:
+
+```bash
+grep -vE '^[0-9]+$|-->' final.srt | grep -nE "[a-zà-ÿ] [A-ZÀ-Ý][a-zà-ÿ]"
+```
+
+Filter out proper nouns and noun phrases ("la Dame Marieuse", "du général Li")
+before treating a hit as a real sentence start.
+
 ---
 
 ## Step 8 — Correct the transcript, line by line
@@ -461,6 +474,18 @@ cues, never include words that also exist in the target language. Adding `a`,
 `on`, `or`, `in` to an English-detection list would delete the French line
 "On a vu" — it scores 67% "English". Restrict such lists to unambiguous tokens
 and always print what you dropped so it can be checked.
+
+**Multi-word patterns must allow newlines.** Cue text contains line breaks, so
+a replacement written with literal spaces silently fails to match:
+
+```python
+["Meuf, porc, poulet", "Boeuf, porc, poulet"]      # WRONG: misses "Meuf,\nporc, poulet"
+["Meuf,\\s+porc,\\s+poulet", "Boeuf, porc, poulet"]  # right
+```
+
+This fails *silently* -- apply_fixes.py reports the cues it did change, not the
+patterns that matched nothing. After applying, always grep the output for the
+old text to confirm each fix actually landed.
 
 **Spell-checker artifacts.** A regex like `[a-zà-ÿ]+` silently strips capitals,
 turning `Habille` into `abille` and generating phantom errors. And hunspell
