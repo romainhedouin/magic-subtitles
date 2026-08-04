@@ -373,6 +373,53 @@ line breaks only, never timings.
 - Musical numbers diverge most between dub and subtitle translations, so that is
   where you will resolve least. Expect it.
 
+### Pass D — independent ASR cross-check (optional, measured low-yield)
+
+The idea: transcribe the audio a second time with a *different model family*,
+and treat disagreement as a hint. Unlike a reference translation, this compares
+two readings of the same audio, so in principle it works inside songs and
+ad-libs.
+
+```bash
+python3 scripts/asr_ctc.py work/chunks work/ctc.json \
+  jonatasgrosman/wav2vec2-large-xlsr-53-french 6
+python3 scripts/cross_check.py draft.srt work/ctc.json work/chunks/cuts.txt --min-len 6
+```
+
+**Measured result on the reference run — read this before spending time on it.**
+Validated by running the detector against 14 errors already confirmed by other
+means:
+
+| | 30 s windows | 6 s windows |
+|---|---|---|
+| Known errors flagged | 7 / 14 | 7 / 14 |
+| Cues flagged (of 777) | 255 (33%) | 234 (30%) |
+| Known errors in top 50 | 0 | 1 |
+| **New errors found** | — | **0** |
+
+Half the known errors were missed, a third of all cues were flagged, and the
+highest-ranked suspects were ordinary correct words (`hommes`, `cheval`,
+`l'empereur`). The cause is structural: a CTC model has no language model, so
+its output diverges from Whisper's nearly everywhere. When disagreement is the
+base rate, disagreement carries little information.
+
+Do not run this expecting results. It is kept because it is cheap (~7 min for a
+90-minute film, since CTC is a single forward pass rather than autoregressive
+decoding) and might do better with a stronger second model — a French-fine-tuned
+Whisper, or a genuinely different family. **A second Whisper run is not a
+substitute**: same weights reproduce the same errors, which was confirmed here
+when whisper.cpp large-v3 independently produced `Chifou`, an error the first
+pass had made too.
+
+### Validate any detector before you trust it
+
+The transferable lesson. Before believing a new error-detection technique,
+**run it against errors you have already confirmed** and measure how many it
+finds and how highly it ranks them. This turns "seems useful" into a number,
+and it is the only thing that separates a real check from a plausible-looking
+list. It cost one command here and prevented shipping a 234-cue list of noise
+as though it were diligence.
+
 ### Hand the remainder to the user
 
 Whatever you could not resolve, present as a table so the user can check it
@@ -509,6 +556,8 @@ All under `scripts/`, all take explicit arguments, none hardcode paths.
 | `build_srt.py` | Rebuild cues with real subtitle constraints |
 | `find_suspects.py` | Dictionary check to surface candidate errors |
 | `review_pairs.py` | Side-by-side draft vs reference for line-by-line review |
+| `asr_ctc.py` | Second-opinion transcript from a wav2vec2 CTC model (optional) |
+| `cross_check.py` | Flag words an independent pass did not confirm (low-yield) |
 | `adjudicate.py` | Show reference text at a suspect's timecode |
 | `apply_fixes.py` | Apply text fixes; asserts timings unchanged |
 | `qa_srt.py` | Structural, readability and coverage QA |
