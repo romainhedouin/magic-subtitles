@@ -1,6 +1,6 @@
 ---
 name: magic-subtitles
-description: Generate subtitles that match a film's dubbed audio, using WhisperX for transcription plus forced alignment, then correcting the transcript against a reference subtitle track extracted from the movie file itself. Use when a user wants accurate subtitles for a movie, wants subtitles matching what the voices actually say (rather than a translation of the original script), or wants to fix badly-timed or mistranslated subtitles.
+description: Generate subtitles that match a film's dubbed audio, transcribing twice with two independent model families (Whisper large-v3 on Metal and NVIDIA Canary-1B-v2) plus forced alignment, then correcting the result against target-language reference subtitles. Use when a user wants accurate subtitles for a movie, wants subtitles matching what the voices actually say (rather than a translation of the original script), or wants to fix badly-timed or mistranslated subtitles.
 ---
 
 # Magic Subtitles
@@ -19,12 +19,18 @@ illustrate the *shape* of each problem, not facts about that film. Expect the
 same shapes in any film and language: invented names, homophone swaps, a fixed
 idiom broken, an insult heard as a proper noun.
 
-The core idea: **transcribe with WhisperX, then correct the transcript against
-a reference subtitle track already inside the movie file.** Almost every video
-release ships subtitles in the dub language. That track is a real human
-translation, timecoded to this exact file. It is the single most valuable asset
-in the process, and it is what makes the difference between "mostly right" and
-"reliable".
+The core idea: **transcribe the audio twice with two unrelated model families,
+then correct the result against human subtitles in the same language.** Whisper
+`large-v3` (on Metal) supplies the timing and the primary wording; NVIDIA
+Canary-1B-v2 is an independent second listener, so where the two agree a line
+needs no further thought and where they differ you have found the exact places
+the audio is ambiguous. The subtitle files — the track inside the movie file, plus
+one fetched online — are human translations timecoded to a real release; they tell
+you what a scene *means* and how every proper noun is *spelled*.
+
+Four sources, each authoritative about something different, none authoritative
+about everything. Step 4 sets out which is which, and Pass B in Step 8 is where
+they are read against each other line by line.
 
 ---
 
@@ -35,15 +41,21 @@ tool, all three in a single call.
 
 ### Q1. Which Whisper model?
 
-Estimates are for a ~90-minute film on Apple Silicon **CPU** (CTranslate2 has no
-Metal backend, so the GPU is not used). With CUDA, divide by roughly 10.
+**Run `large-v3` on Metal via `mlx-whisper`, not on CPU via CTranslate2.** Same
+weights, same accuracy, measured **7× the speed** — this is the default now, and
+Q1 exists only to let the user pick a *smaller* model, not a different runtime.
+Times below are for a ~90-minute film on an M4 Air; see the measured table after
+Q3 for the numbers behind this.
 
-| Model | Time | Notes |
-|---|---|---|
-| `large-v3` | **1–2 h** | Best accuracy. **Use this.** |
-| `large-v3-turbo` | 20–40 min | Distilled decoder. Measurably worse on names and rare words. |
-| `medium` | 20–40 min | Weaker again. |
-| `small` | 10–20 min | Draft quality only. |
+| Model | Metal (`mlx-whisper`) | CPU (CTranslate2) | Notes |
+|---|---|---|---|
+| `large-v3` | **~12 min** | 1–2 h | Best accuracy. **Use this.** |
+| `large-v3-turbo` | ~5 min | 20–40 min | Distilled decoder. Measurably worse on names and rare words. |
+| `medium` | ~5 min | 20–40 min | Weaker again. |
+| `small` | ~3 min | 10–20 min | Draft quality only. |
+
+Because Metal makes `large-v3` cheap, the old speed-vs-accuracy trade is mostly
+gone: there is now no good reason to accept a worse model to save ten minutes.
 
 **Do not reach for `turbo` to save time.** It is a distilled decoder, and the
 accuracy it gives up lands precisely on the words that matter most — proper
@@ -59,11 +71,78 @@ each surviving name error recurs throughout the film. Offer the faster models
 only if the user explicitly accepts a rougher result, and say plainly that the
 review burden grows.
 
+### Measured speeds — use these to give the user an estimate
+
+**All figures measured on an M4 Air (16 GB), 16 kHz mono WAV, French audio.**
+To estimate: `wall seconds ≈ audio seconds ÷ multiple`. A 2 h film is 7200 s of
+audio, so ÷7 ≈ 17 min, ÷15 ≈ 8 min, ÷33 ≈ 3.5 min, ÷1 ≈ 2 h. The Parakeet
+multiple held within 2% across two different films, so treat these as reliable.
+Add a **one-time ~5 min model download** per model, and ~10 s for ffmpeg audio
+extraction.
+
+| Model | Runtime | × realtime | 2 h film | Own timestamps? |
+|---|---|---|---|---|
+| `large-v3` | **`mlx-whisper` (Metal)** | **7.3×** | **~16 min** | Yes, segment-level |
+| `large-v3` | WhisperX (CPU) | ~0.8–1.5× | 1.5–3 h | Yes, segment-level |
+| Canary-1B-v2 | `mlx-audio` (Metal) | **15×** | ~8 min | **No — all zeros** |
+| Parakeet TDT 0.6B v3 | `parakeet-mlx` (Metal) | 33× | ~3.5 min | Yes, incl. word-level |
+
+The 7.3× for `mlx-whisper` **depends on the anti-loop flags** in Step 5a. Without
+them it measures 5.2× *and* produces garbage — see there. `faster-whisper`/WhisperX
+only load Whisper-architecture weights; other models need their own MLX runtime,
+but the **forced-alignment stage is model-agnostic**, so any ASR can feed it.
+
+Parakeet is documented here but **not used by the pipeline** — Canary beat it
+decisively on the same audio and Canary's 8 min is already cheap. Reach for
+Parakeet only if you need a throwaway draft in under 4 minutes.
+
+Accuracy and failure modes, measured on the same French film (1 h 52 m):
+
+| | Parakeet v3 | Canary-1B-v2 |
+|---|---|---|
+| Words transcribed | 7 049 | **9 924** (~40% more speech caught) |
+| Sample line | `Dégage toi les voilà` | `Ça y est, les voilà` (correct) |
+| Sample line | `100 euros que les mettre dans le nom` | `100 euros que je les mets dans le vent` (correct) |
+| Characteristic failure | 20 s+ mega-cues (worst: **233 s**); silent flips to English mid-film | decoder repetition loops (`Escorte. Escorte. Escorte.`) |
+
+**Canary is the accuracy pick, Parakeet the speed pick.** Canary is clearly better
+French, but `mlx-audio` returns `start=0.0, end=0.0` for every segment — it has no
+segmentation at all, so it is only usable *with* the alignment stage, and the audio
+must be pre-chunked with ffmpeg (its `generate` has no chunking and defaults to
+`max_tokens=200`, which truncates anything longer than ~30 s of speech).
+
+Two `mlx-audio` traps:
+
+- **It silently drops `--language`.** The CLI filters kwargs against the named
+  parameters of each model's `generate`, and Canary takes `source_lang`/`target_lang`.
+  So `--language fr` vanishes, the `en`/`en` defaults apply, and Canary returns an
+  English **translation** of French audio. Always pass
+  `--gen-kwargs '{"source_lang":"fr","target_lang":"fr"}'`, or use the Python API.
+  Source and target must always be equal — this pipeline never wants translation.
+- **Cohere-transcribe-03-2026 does not currently work on MLX**, despite topping the
+  Open ASR leaderboard (5.42% WER). Both `beshkenadze` conversions (fp16 and 8-bit)
+  emit token soup that is identical across different audio and equally broken in
+  English, `mlx-community/…-mlx-8bit` is an empty repo, and `cohere_asr`'s VAD path
+  crashes (`mx.array.astype(np.float32)`). Do not spend time on it; the untried
+  routes are the `openasr` Rust binary and the CoreML/ONNX conversions.
+
 ### Q2. Which language is the audio in?
 
 Default **French**. Offer **English** as the other suggestion. Accept anything
 else the user types — the pipeline is language-generic, but you need the right
-code in three places: Whisper (`fr`), tesseract (`fra`), hunspell (`fr`).
+code in four places: Whisper (`fr`), Canary `source_lang`/`target_lang` (`fr`),
+tesseract (`fra`), hunspell (`fr`).
+
+Canary covers 25 European languages. If the user names something outside that
+set, run Step 5a only and tell them the second-opinion pass is unavailable for
+this language.
+
+### Q2b. Do you have a target-language subtitle file for this release?
+
+Ask it here, not later. Step 4b needs one and will go searching online if the
+user has none — but they often have a `.srt` sitting next to the video, and
+knowing that up front saves a search. Discovering it *after* transcribing wastes
+the verification stage.
 
 ### Q3. Burn the subtitles into the video?
 
@@ -179,13 +258,26 @@ cares about song lyrics, and then only on those passages.
 
 ---
 
-## Step 4 — Get the reference transcript
+## Step 4 — Get the reference sources
 
 This is the step that makes the result reliable. **Do not skip it.**
 
-The reference must be a genuine transcript in the **dub language**, not a
-translation of the English script. A subtitle track from the release itself
-qualifies; a machine translation of the original screenplay does not.
+Gather up to three text sources before transcribing. They do different jobs and
+are **not** interchangeable — this table is the one to keep in mind for the rest
+of the run:
+
+| Source | Label | What it is good for | What it must never do |
+|---|---|---|---|
+| Subtitle track inside the movie file (4a) | `REF` | Detecting that a line is wrong; recovering meaning | Bulk-replacing wording — it is a different translation |
+| Target-language subtitle found online (4b) | `WEB` | **Proper-noun spellings**, scene meaning, second opinion on `REF` | Settling wording, or supplying timings |
+| Canary transcript (Step 5b) | `CAN` | Confirming or challenging the actual words heard | Providing timings — its cues are fixed windows |
+
+Both text sources must be in the **dub/target language** (typically French), never
+the original English. Be clear-eyed about what they are, though: an ordinary
+subtitle file is virtually always translated from the English original rather than
+transcribed from the dub, so it is a *semantic parallel text* — right about what
+the scene means, unreliable about the exact words the voices say. An SDH track is
+the exception and the prize (see 4b).
 
 ### 4a. Preferred: a subtitle track inside the movie file
 
@@ -209,11 +301,19 @@ against the source bitmap before "fixing" them** — see Pitfalls.
 
 ### 4b. Optional: a supplementary reference found online
 
-**Optional, but very valuable when you find one — spend real effort looking.**
-If you can find a transcript or subtitle file **in the dub language** for this
-film, use it alongside the in-file track. A second reference resolves cases
-where the first is too divergent to judge, which is the single biggest cause of
-errors that survive to the end.
+**Required, unless the user supplied one — always search.** Do not treat this as
+optional and do not skip it because 4a succeeded. A second reference resolves
+cases where the first is too divergent to judge, which is the single biggest
+cause of errors that survive to the end. Save it as `web.srt`.
+
+Search by exact release name first, then by title and year
+(`"Intouchables 2011 sous-titres français srt"`). Check the release folder and
+the container's own tracks before searching the web — a `.srt` is often sitting
+right next to the video file.
+
+It must be **in the dub/target language** (typically French). Do **not** settle
+for an English file: the original-language script disagrees with the dub
+everywhere and generates confident false corrections.
 
 Best target: a **SDH / "sourds et malentendants" / hearing-impaired** subtitle
 track. Unlike an ordinary subtitle translation, SDH transcribes the *dub audio*
@@ -221,22 +321,40 @@ itself, so it matches what the voices say almost word for word. That is the one
 artefact that would resolve nearly everything a normal reference cannot. Search
 for it explicitly.
 
-Ordinary subtitle files in the dub language are much weaker: they are another
-independent translation, so they diverge from the dub in the same places the
-first reference does, and add less than you would expect.
+**Understand what you have found, because it decides how much to trust it.**
+Ordinary target-language subtitles are *virtually always translated from the
+English original*, not transcribed from the dub. So they carry the meaning of the
+scene faithfully and the wording of the dub only loosely — they diverge from the
+dub in the same places, and for the same reason, as the in-file track. Two such
+files are two translations of one English script, not two witnesses to the audio.
+
+What that means in practice, and it is worth being precise because this is where
+false corrections come from:
+
+- **Strong on proper nouns.** Names survive translation intact, so this is the
+  most reliable thing a web subtitle gives you. ASR spells names phonetically
+  (`Salut, chienne peau` for `Chien-Po`); the subtitle has the canonical spelling
+  of every character, place and brand.
+- **Strong on meaning.** When the two ASR passes produce plausible-but-different
+  French, the subtitle line usually makes it obvious which reading fits the scene.
+- **Weak on wording.** It cannot settle a choice between two French readings that
+  mean the same thing. Do not let it.
+- **Useless as timing.** It is timed to *some* release, not necessarily yours. Use
+  it as a **drift check** (does dialogue start at about the same time at 10 min,
+  60 min, 100 min?) and never as a timing source. See "Validate timing by drift,
+  not by offset" in Step 9.
 
 Two rules:
 
-- It must be **dub-language**. A transcript of the original-language script,
-  or a machine translation of one, is worse than useless: it will confidently
-  disagree with the dub everywhere and generate false corrections.
 - Use it to **verify and adjudicate**, never to bulk-replace the transcript.
   Do not copy a full screenplay into the output file; quote only what you need
   to settle a specific word.
+- If both 4a and 4b produced a file, keep them **separate** (`reference.srt` and
+  `web.srt`) and pass both to Pass B. They agree often, and where they disagree
+  you have learnt something real about which one tracks the dub.
 
-**If you cannot find one, that is fine — carry on.** The in-file track plus the
-Step 1 synopsis is enough. Just expect a slightly longer manual-review table at
-the end, and say so.
+**If you genuinely cannot find one, say so and carry on.** The in-file track plus
+the Step 1 synopsis is enough; just expect a longer manual-review table at the end.
 
 ### 4c. Fallback: ask the user
 
@@ -265,36 +383,85 @@ voices; that is the whole point.
 
 ---
 
-## Step 5 — Transcribe with WhisperX, in chunks
+## Step 5 — Transcribe twice, with two different model families
 
-```bash
-uv venv --python 3.12 .venv && source .venv/bin/activate
-uv pip install whisperx
-```
+**Run both passes. This is not optional.** Whisper supplies the timing and the
+primary wording; Canary is an architecturally independent second listener, and
+where the two agree a line needs no further thought. Together they cost about
+25 minutes for a 2-hour film on Metal, which is less than the old single CPU pass.
 
-**Chunk the audio. Do not run WhisperX on a full-length film.** It loads the
-entire waveform as float32 (~5.6 GB for 90 min) alongside the model, VAD and
-alignment nets, and gets OOM-killed on a 16 GB machine. The kill surfaces as
-exit code **137**, and a shell wrapper can mask it as "exit 0" — check for the
-output file, not the exit status.
-
-Split on silence so no cut lands mid-word:
+Split the audio once, on silence, so no cut lands mid-word — both passes reuse it:
 
 ```bash
 python3 scripts/chunk_audio.py audio.wav work/chunks 600   # ~10-min targets
 ```
 
-Then transcribe each chunk, **checkpointing per chunk**:
+### 5a. Whisper `large-v3` on Metal
 
 ```bash
-bash scripts/run_chunks.sh work/chunks work/srt large-v3 fr
+uv tool install mlx-whisper
 ```
 
-`run_chunks.sh` skips any chunk whose SRT already exists. This matters: in the
-reference run a process kill destroyed the wrapper but ~70 minutes of completed
-work survived and the run resumed cleanly. Re-run the same command to resume.
+```bash
+mlx_whisper work/chunks/000.wav \
+  --model mlx-community/whisper-large-v3-mlx --language fr \
+  --condition-on-previous-text False --hallucination-silence-threshold 2 \
+  --output-format srt --output-dir work/srt --output-name 000
+```
 
-Run it in the background and monitor completions rather than blocking.
+**The two flags are mandatory, not tuning.** `mlx-whisper` has no VAD, so with
+default settings it falls into repetition loops that WhisperX's VAD would have
+prevented. Measured on a 10-minute French clip:
+
+| | default | `--condition-on-previous-text False --hallucination-silence-threshold 2` |
+|---|---|---|
+| Cues produced | 297 | 173 |
+| Cues that were one looped line | **217 (73%)** | 0 |
+| Speed | 5.2× realtime | **7.3× realtime** |
+
+The clean run is also the faster run, because the loop was burning decode time
+generating `C'est plus prudent !` 217 times. Still run Pass C afterwards — this
+same clip yielded `Sous-titrage ST' 501`, a subtitling-house hallucination.
+
+Chunking remains worthwhile even though Metal is fast: it gives per-chunk
+checkpointing, and `align_words.py` in Step 6 consumes per-chunk SRTs.
+
+**If Metal is unavailable** (non-Apple hardware, or MLX broken), fall back to
+WhisperX on CPU with `bash scripts/run_chunks.sh work/chunks work/srt large-v3 fr`
+and warn the user it will take 1.5–3 h instead of ~16 min. `run_chunks.sh` skips
+any chunk whose SRT already exists — in the reference run a process kill destroyed
+the wrapper but ~70 minutes of completed work survived and resumed cleanly. On CPU,
+**do not run a full-length film in one pass**: it loads the whole waveform as
+float32 (~5.6 GB for 90 min) alongside the model, VAD and alignment nets, and gets
+OOM-killed on a 16 GB machine. The kill surfaces as exit code **137**, and a shell
+wrapper can mask it as "exit 0" — check for the output file, not the exit status.
+
+Run either pass in the background and monitor completions rather than blocking.
+
+### 5b. Canary-1B-v2, the independent second pass
+
+```bash
+uv tool install mlx-audio
+```
+
+```bash
+"$(uv tool dir)/mlx-audio/bin/python" scripts/run_canary.py \
+  audio.wav work canary.srt fr
+```
+
+`run_canary.py` handles the three things Canary gets wrong on its own, and its
+docstring explains each: it splits the audio into 30 s windows (Canary does no
+chunking and silently truncates at `max_tokens=200`), reconstructs a timecode per
+window (mlx-audio returns `start=0.0, end=0.0` for everything), and always sets
+`source_lang == target_lang` (otherwise you get a *translation*, and mlx-audio's
+CLI silently drops `--language`, so French audio comes back as fluent English with
+no warning). It checkpoints per window and resumes.
+
+**`canary.srt` is a wording source, not a timing source.** Its cue boundaries are
+30-second window boundaries, so never let it near the timing stage. Its
+characteristic failure is decoder repetition inside a window
+(`Escorte. Escorte. Escorte.`) — repetition in `CAN` means "ignore this window",
+not "the dub repeats itself".
 
 ---
 
@@ -414,19 +581,56 @@ python3 scripts/find_suspects.py draft.srt fr --foreign en
 python3 scripts/adjudicate.py draft.srt reference.srt fr WORD1 WORD2 ...
 ```
 
-### Pass B — contextual line-by-line read (mandatory, catches the rest)
+### Pass B — contextual line-by-line read against all sources (mandatory)
 
-Read **every cue** against the reference at the same timecode. Do not skip this
+Read **every cue** against **every source** at the same timecode. Do not skip this
 and do not sample it. Work in batches of 100–150 cues so each batch fits
 comfortably in context:
 
 ```bash
-python3 scripts/review_pairs.py draft.srt reference.srt 1 150
-python3 scripts/review_pairs.py draft.srt reference.srt 151 300
-# ... continue to the end
+python3 scripts/review_pairs.py draft.srt 1 150 \
+  CAN=canary.srt REF=reference.srt WEB=web.srt
+python3 scripts/review_pairs.py draft.srt 151 300 \
+  CAN=canary.srt REF=reference.srt WEB=web.srt
+# ... continue to the end; each run prints the next batch's command
 ```
 
-For each cue ask:
+Every source you obtained must be passed. Omit `REF` if the film had no in-file
+track, or `WEB` if the search genuinely failed, but never omit `CAN`.
+
+**How to weigh the voices.** Each answers a different question, and confusing them
+is how false corrections get made:
+
+| | Authority on | Explicitly NOT authority on |
+|---|---|---|
+| `ASR` (Whisper) | **Timing**, and the wording being judged | — |
+| `CAN` (Canary) | What was **said** — an independent listen | Timing (30 s windows) |
+| `REF` (in-file subtitle) | **Whether** a line is wrong; meaning | Exact wording |
+| `WEB` (online subtitle) | **Proper-noun spellings**; scene meaning | Any wording choice; timing |
+
+`REF` and `WEB` are **not** independent of each other — both are typically
+translations of the same English script — so their agreement is weak evidence
+about the dub. Only `ASR` and `CAN` are genuine witnesses to the audio.
+
+Read them as a decision procedure, in this order:
+
+1. **`ASR` and `CAN` agree** → the line is almost certainly right. Two independent
+   architectures rarely share an error. Move on, even if `REF` words it differently
+   — that is just translation divergence. This is what makes the two-model cost
+   worth it: it lets you *stop thinking* about most cues.
+2. **`ASR` and `CAN` differ** → the audio is genuinely ambiguous here, and this is
+   the highest-yield signal in the whole pipeline. Now use `REF` and `WEB` for the
+   meaning of the scene, plus the Step 1 synopsis and glossary, and pick the
+   reading that fits. Prefer whichever ASR is consistent with the established
+   context; Canary was measurably the better French transcriber, so on a pure
+   coin-flip it wins — but only after the meaning check, never before.
+3. **Both ASR passes agree but the line is nonsense** in context → the audio
+   misled both. Only `REF`/`WEB`/synopsis can save it, and often nothing can: send
+   it to the user-review table rather than inventing a fix.
+4. **A proper noun is involved** → `WEB`/`REF` decide the spelling, always,
+   regardless of what the two ASR passes heard.
+
+Then, for each cue, ask:
 
 1. **Does it make sense** in this scene, given the synopsis from Step 1?
 2. **Does it match the reference's meaning**, even if the wording differs?
@@ -535,7 +739,10 @@ out of a single line, which changes whether a pattern matches at all.
 
 ### On running several models for "multiple sources"
 
-Tempting, and mostly measured *not* to work. Record before repeating it:
+The pipeline now runs two (Step 5), but the constraint that governs *which* two is
+narrow, and the failures below are all still real. What matters is that the second
+model be **independent and individually strong**; either property missing and it
+adds nothing:
 
 - **Two Whisper variants are not independent.** They share weights and training
   data, so they reproduce each other's errors. Confirmed directly: whisper.cpp
@@ -543,28 +750,40 @@ Tempting, and mostly measured *not* to work. Record before repeating it:
   the identical error the CTranslate2 `large-v3` run made, which had already
   been corrected by hand. A second Whisper pass
   will confidently agree with the first that `les Huns` is `les uns`.
-- **A different architecture is genuinely independent but weak.** The wav2vec2
-  CTC pass (Pass D) is architecturally unrelated, and still found 0 new errors.
+- **An independent but weak model adds nothing.** The wav2vec2 CTC pass (Pass D)
+  is architecturally unrelated and found 0 new errors, because a model with no
+  language model disagrees with Whisper nearly everywhere — and when disagreement
+  is the base rate, disagreement carries no information.
+- **Canary-1B-v2 is the one that satisfies both** — NeMo FastConformer lineage
+  (genuinely unrelated to Whisper) *and* strong French. It is the "individually
+  strong, genuinely diverse second system" this section used to list as untested.
+  Measured against Parakeet TDT v3 on the same French film, Canary read
+  `Ça y est, les voilà` and `100 euros que je les mets dans le vent` where Parakeet
+  read `Dégage toi les voilà` and `100 euros que les mettre dans le nom`.
 - **Do not run them concurrently on CPU.** CTranslate2 already saturates the
-  cores; three parallel runs are roughly three times slower each, with no
-  wall-clock gain. Run sequentially, or in parallel only with a GPU.
+  cores; parallel runs are proportionally slower each with no wall-clock gain.
+  On Metal this no longer applies, but run them sequentially anyway — each pass
+  wants the whole GPU.
 
-What remains untested, and is the version worth trying if you want to revisit
-this: a **three-way vote** across genuinely diverse *and* individually strong
-systems — e.g. `large-v3`, a French-fine-tuned Whisper, and a CTC model — taking
-majority agreement rather than pairwise disagreement. Two-way comparison against
-a weak second system is what failed here; that is a narrower result than "model
-diversity doesn't help".
+An honest caveat on the evidence: Canary was compared head-to-head against
+Parakeet, and against Whisper only on sample lines, not by WER against a human
+reference. Its *independence* from Whisper is architectural fact; its *superiority*
+to Whisper on French is not established. That is why Step 5a stays the timing and
+primary-wording source and Canary is the second opinion, rather than the reverse.
 
 Spend the effort on Step 1 (synopsis) and Pass B (line-by-line) first. Both
 were measured to catch far more, for far less compute.
 
-### Pass D — independent ASR cross-check (optional, measured low-yield)
+### Pass D — wav2vec2 CTC cross-check (superseded, kept for the record)
+
+**Pass B now does this properly with Canary as the `CAN` source.** This pass was
+the earlier, weaker attempt at the same idea and is retained only because its
+measured failure is instructive — do not run it as well.
 
 The idea: transcribe the audio a second time with a *different model family*,
 and treat disagreement as a hint. Unlike a reference translation, this compares
 two readings of the same audio, so in principle it works inside songs and
-ad-libs.
+ad-libs. It is the right idea with a model too weak to deliver it.
 
 ```bash
 python3 scripts/asr_ctc.py work/chunks work/ctc.json \
@@ -1105,9 +1324,10 @@ All under `scripts/`, all take explicit arguments, none hardcode paths.
 | `align_words.py` | Alignment-only pass for word-level timings |
 | `build_srt.py` | Rebuild cues with real subtitle constraints |
 | `find_suspects.py` | Dictionary check to surface candidate errors |
-| `review_pairs.py` | Side-by-side draft vs reference for line-by-line review |
-| `asr_ctc.py` | Second-opinion transcript from a wav2vec2 CTC model (optional) |
-| `cross_check.py` | Flag words an independent pass did not confirm (low-yield) |
+| `review_pairs.py` | Draft vs every source (`CAN`/`REF`/`EN`) for line-by-line review |
+| `run_canary.py` | Independent second transcript from Canary-1B-v2 on Metal |
+| `asr_ctc.py` | Superseded by `run_canary.py`; wav2vec2 CTC second opinion |
+| `cross_check.py` | Superseded; flags words a CTC pass did not confirm (low-yield) |
 | `adjudicate.py` | Show reference text at a suspect's timecode |
 | `apply_fixes.py` | Apply text fixes; asserts timings unchanged |
 | `qa_srt.py` | Structural, readability and coverage QA |
@@ -1119,11 +1339,11 @@ a mismatch fails quietly rather than loudly. Change all of these together:
 
 | Where | French | English | Note |
 |---|---|---|---|
-| `whisperx --language` | `fr` | `en` | ISO-639-1 |
+| `mlx_whisper --language` | `fr` | `en` | ISO-639-1 |
+| `run_canary.py` 4th arg | `fr` | `en` | sets `source_lang` **and** `target_lang` |
 | `tesseract -l` (OCR) | `fra` | `eng` | ISO-639-2; needs `tesseract-lang` |
 | `hunspell -d` | `fr` | `en_US` | dictionary must be installed |
 | `align_words.py` | `fr` | `en` | picks the wav2vec2 alignment model |
-| `asr_ctc.py` model id | `...xlsr-53-french` | `...xlsr-53-english` | optional Pass D |
 | `build_srt.py` / `fix_ocr.py` | `fr` | `en` | punctuation spacing |
 
 Two things that are genuinely language-specific, not just a code:
@@ -1142,8 +1362,16 @@ language-neutral.
 
 ```bash
 brew install ffmpeg tesseract tesseract-lang hunspell
+uv tool install mlx-whisper     # Step 5a, Metal
+uv tool install mlx-audio       # Step 5b, Canary-1B-v2
+# CPU fallback only, if MLX/Metal is unavailable:
 uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install whisperx
 ```
+
+`mlx-audio` installs its own interpreter; call `run_canary.py` with it rather than
+the project venv: `"$(uv tool dir)/mlx-audio/bin/python" scripts/run_canary.py ...`.
+Both MLX packages need Apple Silicon. Each model downloads ~2–3 GB on first use.
+`align_words.py` (Step 6) still needs the whisperx venv — it uses wav2vec2, not MLX.
 
 **`brew install ffmpeg` is not enough for hard burn.** The core formula no longer
 bundles libass, so the `subtitles` and `ass` filters are absent and burn-in is
