@@ -74,11 +74,24 @@ Three outcomes, and the user should understand the trade:
 - **Soft-mux** — remux the subtitle track into the container. Fast, picture
   untouched, toggleable in the player. Almost always what people actually want.
 - **Hard burn (pixel-embed)** — subtitles painted into the picture. Requires a
-  full video re-encode: slow (1–3× realtime), lossy, permanent, and the file
-  cannot be turned off. Only do this if the target device can't handle subtitle
+  full video re-encode: lossy, permanent, and the file cannot be turned off.
+  Roughly realtime with `libx264 -preset medium`, but ~9× realtime with a
+  hardware encoder. Only do this if the target device can't handle subtitle
   tracks.
 
 Steer toward soft-mux if the user asks for burn-in without a specific reason.
+
+If they do choose hard burn, three further answers change the command, so get
+them before starting — but get them **when you reach the burn**, not now, since
+they depend on the finished subtitle file and on probing the video:
+
+- **font size**, as a fraction of frame height, and whether two-line cues may
+  overlap the picture when the source is letterboxed
+- **encoder** — hardware (minutes, weaker per bit) vs software (hours, best
+  quality per byte)
+- **size budget**, which is how you calibrate a hardware encoder's bitrate
+
+See "Hard burn" in Step 10 for why the font size cannot be a fixed number.
 
 These three are the *minimum*. Ask more whenever an answer would change the
 plan — see "Asking the user is expected, not a fallback" in Step 8. Checking
@@ -295,6 +308,54 @@ alignment-only pass — a wav2vec2 forward pass, no re-transcription:
 python3 scripts/align_words.py work/chunks work/srt work/words.json fr
 ```
 
+### Clamp implausible word durations before building cues
+
+The aligner can only place words **inside the segment window whisper gave it**.
+Wherever whisper closed a segment early, the words get crammed, and wherever it
+left a long window around a short utterance, one word can absorb seconds of
+silence. Check the distribution before trusting it:
+
+```bash
+python3 - <<'EOF'
+import json
+d = json.load(open('work/words.json'))
+durs = sorted(w['end'] - w['start'] for ws in d.values() for w in ws)
+n = len(durs)
+for q in (50, 90, 99, 99.9):
+    print(f'p{q}: {durs[int(n * q / 100)]:.2f}s')
+print('max:', round(durs[-1], 2), ' over 2s:', sum(1 for x in durs if x > 2))
+EOF
+```
+
+A healthy French/English distribution sits around p50 ≈ 0.15 s and p99 ≈ 1 s. A
+maximum in the double digits means an outlier, and it does **two** kinds of
+damage — the obvious over-long cue, and a much less obvious one: because
+`build_srt.py` splits whenever the gap between consecutive words exceeds 0.8 s,
+an inflated word manufactures a fake gap and **tears its sentence into three
+cues**. Fixing the SRT afterwards would leave those bad splits in place.
+
+Clamp at the word level instead, keeping each word's start (its onset is
+usually right; only the end is wrong):
+
+```python
+cap = min(4.5, max(1.2, 0.12 * len(word.strip())))   # generous for sung/held notes
+w['end'] = min(w['end'], w['start'] + cap)
+```
+
+In the reference run this touched 0.6% of words and simultaneously removed every
+cue over 6 s and rejoined the torn sentences.
+
+**Two things measured not to work** — don't spend time rediscovering them:
+
+- **Widening the segment windows before aligning** (padding each into the gap to
+  its neighbours) sounds like the principled fix and does nothing when whisper's
+  segments are already back-to-back, because `min(next_start, …)` leaves no room.
+  It made the output worse: cues over 6 s went 4 → 10 as isolated words sprawled.
+- **A single word's bad duration is not evidence the alignment failed.** Verify
+  against the audio before "fixing" a pause: an energy profile of the window will
+  often show the silence is real, meaning the split is correct and only the
+  duration needs clamping.
+
 ---
 
 ## Step 7 — Build the subtitle file
@@ -420,6 +481,48 @@ dropped.
 
 If a replacement lengthens a line past 42 characters, re-wrap it — that changes
 line breaks only, never timings.
+
+#### Verify every pattern landed, with newlines normalised
+
+`apply_fixes.py` reports the cues it *changed*, never the patterns that matched
+nothing. So a fix can silently fail and the run still looks successful. Write
+every literal space in a pattern as `\s+` by default, and then prove it:
+
+```python
+import json, re
+cfg = json.load(open('fixes.json'))
+# Join each cue's lines into ONE space-separated string before searching.
+cues = []
+for b in re.split(r'\n\s*\n', open('final.srt', encoding='utf-8').read().strip()):
+    L = b.split('\n')
+    if len(L) >= 3:
+        cues.append(' '.join(' '.join(L[2:]).split()))
+missed = [p for p, _ in cfg['replacements'] if re.search(p, '\n'.join(cues), re.M)]
+print(f'patterns still matching the output: {len(missed)}', missed)
+```
+
+**The newline normalisation is the whole point.** Searching the output with its
+line breaks intact reproduces the very failure you are hunting: a pattern with a
+literal space does not match the wrapped phrase in the output either, so it is
+reported as absent and you conclude the fix worked. In the reference run that
+false "all clean" hid **16 failed fixes across three rounds**, each asserted to
+the user as applied. Normalising newlines first exposed all of them at once.
+
+A pattern can never bridge a **cue** boundary — `apply_fixes.py` works per cue.
+When a sentence runs across two cues, the words either side of the split live in
+different strings, so no amount of `\s+` will join them:
+
+```
+cue N     "... and he said the old"      <- pattern "the old CAR" cannot match
+cue N+1   "CAR was finished."               across these two cues
+```
+
+Anchor the pattern to the cue that actually contains the wrong word
+(`^CAR\s+was finished`). Watch for this whenever a fix refuses to land even
+after `\s+` has been applied.
+
+Re-run the check after *every* build. Line-break changes can move a phrase in or
+out of a single line, which changes whether a pattern matches at all.
 
 ### Judgement rules
 
@@ -555,8 +658,26 @@ timestamp in `HH:MM:SS` so it can be typed straight into a player. In
 user recognise the line without hunting for it.
 
 Group by ease: short isolated shouts first, mid-sentence errors next, sung lines
-last. Flag anything you believe is probably *correct* (real slang, a deliberate
-dub invention) so the user does not waste time on it.
+last.
+
+**Do not tell the user which items to skip.** It is tempting to mark a few as
+"probably correct — a deliberate dub invention, don't waste time on these". That
+call is unreliable in exactly the cases where it feels safest. In the reference
+run three items were confidently set aside as intentional malapropisms and **all
+three were wrong** — each was a *different* malapropism from the one the ASR had
+produced, which no amount of reading could have revealed. The user resolved all
+three in seconds once they were simply listed.
+
+List every unresolved line plainly and let the user's ears decide. If you have a
+hypothesis, offer it as the suggested reading in its own column rather than as a
+reason not to check.
+
+**Expect your own confident fixes to be wrong too, in a specific direction.**
+Corrections derived from the reference are safe when they restore a fixed idiom
+or a glossary name. They are much weaker when the reference merely *implies* a
+meaning: the dub may render the same joke with entirely different words, and a
+plausible reconstruction will read fine while being wrong. Prefer flagging over
+reconstructing whenever the evidence is semantic rather than lexical.
 
 ### The endgame is the user, and that is fine
 
@@ -602,6 +723,55 @@ Investigate any coverage gap of more than a few seconds. In the reference run
 the single 18-second gap turned out to be a musical passage — legitimate, but
 worth confirming rather than assuming.
 
+### Validate timing by drift, not by offset
+
+Matching output cues to the reference by word overlap and reading the
+start-delta distribution is the cheapest real check on timing. Read it correctly:
+
+- **A stable offset is not an error.** Cues built from acoustic word onsets will
+  sit consistently *later* than a professional reference, because subtitlers cue
+  in slightly before speech. A steady median of roughly +0.3 to +0.6 s is the
+  expected signature of correct timing.
+- **Drift is the failure to hunt.** Bucket the deltas by position in the film and
+  compare medians. Values that stay flat across the whole runtime mean the chunk
+  offsets are being applied correctly; a median that grows means a chunking or
+  offset bug and nothing downstream can be trusted.
+
+### Separate on-screen signage from missed dialogue
+
+Reference subtitle tracks translate **forced narrative** — signs, captions,
+on-screen text — usually in ALL CAPS. Those have no counterpart in a transcript
+of the spoken dub, so counting them as "uncovered" understates coverage and
+sends you hunting for dialogue that was never spoken. Partition before quoting a
+number:
+
+```python
+def is_sign(text):
+    letters = [c for c in text if c.isalpha()]
+    return bool(letters) and sum(c.isupper() for c in letters) / len(letters) > 0.85
+```
+
+What remains is genuinely missed speech, and it is dominated by very short crowd
+shouts and interjections — the hardest thing for the ASR under music and noise.
+
+**A targeted re-transcription of gap windows is worth one attempt and rarely
+more.** In the reference run, re-running the largest gaps recovered exactly one
+substantive line out of dozens; the rest were genuinely masked. Try it once,
+report what it found, and put the remainder in the user-review table rather than
+grinding.
+
+Also resist the tempting diagnosis. "Crowd lines are missing because we took the
+centre channel and crowds are mixed into the surrounds" is plausible, cheap to
+test, and was **measured false** — the centre channel was equally loud or louder
+at four of five sampled misses. Compare levels before believing it:
+
+```bash
+for t in <timestamps>; do
+  ffmpeg -hide_banner -ss $t -t 3 -i "$MOVIE" -map 0:a:0 \
+    -af "pan=mono|c0=c2,volumedetect" -f null - 2>&1 | grep mean_volume
+done
+```
+
 ---
 
 ## Step 10 — Deliver
@@ -635,13 +805,163 @@ ffmpeg -y -i "$MOVIE" -i final.srt -map 0:v:0 -map 0:a:0 -map 1 \
   -c:s srt -metadata:s:s:0 language=fra "output.mkv"
 ```
 
-Hard burn (only if the user explicitly chose it — slow, lossy, permanent):
+### Hard burn (only if the user explicitly chose it — slow, lossy, permanent)
+
+**First check that ffmpeg can render subtitles at all.** Both the `subtitles`
+and `ass` filters come from libass, and plenty of builds ship without it —
+Homebrew's core `ffmpeg` formula no longer bundles libass, so a stock `brew
+install ffmpeg` cannot burn subtitles. The failure is badly disguised:
+
+```
+[AVFilterGraph] No option name near 'final.srt'
+Error opening output file out.png.
+Error opening output files: Invalid argument
+```
+
+That reads like a path, quoting or output-format problem, and you can lose a
+long time escaping quotes differently. It only means the filter does not exist.
+Check first, and check for a fuller build before installing anything:
 
 ```bash
-ffmpeg -y -i "$MOVIE" -vf "subtitles=final.srt:force_style='FontSize=24'" \
-  -map 0:v:0 -map 0:a:0 \
+ffmpeg -filters | grep -E '\bsubtitles\b|\bass\b'     # empty  -> no libass
+ls /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg           # keg-only, usually has it
+/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg -buildconf | grep enable-libass
+```
+
+#### `FontSize` is not pixels — size it from the frame height
+
+This is the single most time-consuming trap in the burn step. `FontSize` in
+`force_style` is expressed in the coordinate system of the ASS *script*, not the
+video. libass scales the script to the frame, so:
+
+```
+effective_px  =  FontSize x (frame_height / PlayResY)
+```
+
+When ffmpeg converts an SRT it synthesises an ASS header with **PlayResX 384,
+PlayResY 288** and `Fontsize 16`. So the same `FontSize` number means wildly
+different things depending on the source:
+
+| Frame height | scale vs PlayResY 288 | `FontSize=24` renders as |
+|---|---|---|
+| 720p  | x2.5  | ~60 px |
+| 1080p | x3.75 | **~90 px** |
+| 4K    | x7.5  | ~180 px |
+
+A bare `FontSize=24` is therefore meaningless on its own, and on 1080p it is
+roughly double a normal subtitle. **Do not carry a fixed number between films.**
+
+The fix is to stop working in the synthetic 288-line space. Convert to ASS,
+rewrite `PlayRes` to the real frame size, and then the number *is* pixels:
+
+```bash
+ffmpeg -y -i final.srt work/base.ass
+W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width  -of csv=p=0 "$MOVIE")
+H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$MOVIE")
+sed -i '' -e "s/^PlayResX: .*/PlayResX: $W/" -e "s/^PlayResY: .*/PlayResY: $H/" work/base.ass
+```
+
+Then size relative to the frame, since that is what actually scales:
+
+- **font ≈ 4.5–5% of frame height** — 1080p → 49–54 px, 720p → 32–36 px, 4K → 97–108 px
+- **outline ≈ 6% of the font** (~3 px at 1080p). The ASS default `Outline 1` was
+  chosen for a 288-line script; left alone it is a hairline that disappears
+  against bright scenes.
+- **MarginV ≈ 4–5% of frame height** (~50 px at 1080p). The default `10` sits
+  almost on the frame edge once PlayResY is the real height.
+- Bold (`-1` in the style's Bold field) reads better over moving picture.
+
+```
+Style: Default,Arial,52,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,1.5,2,60,60,54,1
+                        ^font                                       ^bold                      ^outline    ^marginV
+```
+
+Burn the ASS (not the SRT), so the styling is explicit and reproducible:
+
+```bash
+ffmpeg -y -i "$MOVIE" -map 0:v:0 -map 0:a:0 -sn \
+  -vf "ass=work/base.ass" \
   -c:v libx264 -crf 18 -preset medium \
   -c:a aac -profile:a aac_low -b:a 192k -ac 2 "output-burned.mkv"
+```
+
+#### Check for letterboxing before choosing the size
+
+A scope film in a 16:9 container has black bars, and subtitles can often sit
+entirely inside the lower bar so they never cover picture at all. Whether they
+fit is arithmetic, not taste:
+
+```bash
+ffmpeg -hide_banner -ss 600 -i "$MOVIE" -vf cropdetect=round=2 -frames:v 40 -f null - 2>&1 \
+  | grep -oE 'crop=[0-9:]+' | sort | uniq -c | sort -rn | head -3
+# crop=W:H:X:Y  ->  bottom bar height = frame_height - (H + Y)
+```
+
+Whether a two-line cue clears the picture is predictable. Measured across three
+renders on a 1080-high frame, agreeing to within 1.6 px:
+
+```
+visible ink of a two-line cue  ~=  1.6 x font_px
+top edge of that cue           ~=  frame_height - MarginV - 1.8 x font_px
+```
+
+Compare that top edge against `crop_h + crop_y` from `cropdetect`. If it lands
+above the boundary, the first line sits over the picture, and the shortfall in
+pixels is exactly `(crop_h + crop_y) - top_edge`.
+
+Note this is *ink* extent, not line boxes — reasoning from nominal line height
+(~1.2 x font per line, so ~2.4 x for two) overestimates by half a line and will
+talk you out of a size that actually fits.
+
+Offer the user the choice explicitly, with the pixel figures: it is a real
+trade-off between legibility and never obscuring the image, and only they can
+weigh it. Expect them to accept a few pixels of overlap for a more readable size.
+
+**Measure the result, do not eyeball it.** Render one still per candidate size
+and find the text's actual bounding box:
+
+```bash
+ffmpeg -y -v error -copyts -ss <t> -i "$MOVIE" -vf "ass=work/base.ass" \
+  -frames:v 1 -update 1 frame.png      # -update 1 is required for a single PNG
+```
+
+```python
+from PIL import Image
+im = Image.open('frame.png').convert('L'); w, h = im.size; px = im.load()
+# scan only the lower strip, and require a run of bright pixels -- a single
+# threshold over the whole frame will happily "find" highlights in the picture
+rows = [y for y in range(int(h * 0.8), h)
+        if sum(1 for x in range(0, w, 2) if px[x, y] > 200) >= 8]
+print(f'text occupies y={min(rows)}-{max(rows)}')
+```
+
+Compare that against the `cropdetect` boundary to state plainly whether a
+two-line cue clears the picture, and by how many pixels.
+
+#### Pick the encoder deliberately, and calibrate the bitrate
+
+Hardware encoders (`h264_videotoolbox`, `hevc_videotoolbox`, NVENC, QSV) turn a
+multi-hour software encode into minutes — measured at ~9x realtime versus
+roughly realtime for `libx264 -preset medium`. They are weaker per bit, and the
+right compensation is bitrate headroom, so ask the user for a size budget.
+
+Many hardware encoders expose no CRF/quality mode, only bitrate. Do not guess
+the bitrate needed to hit a size target: **run the encode for ~90 seconds, read
+the real rate, and solve.** Output is far below the requested `-b:v` on easy
+content, and the shortfall is not proportional, so one probe is not enough —
+take two and interpolate:
+
+```bash
+ffmpeg ... -progress work/encode.progress "$OUT"    # then:
+tail -c 500 work/encode.progress | tr '\r' '\n' | grep -E 'out_time=|total_size'
+# projected_bytes = total_size x (duration / out_time)
+```
+
+Cheap to redo at 9x realtime, so calibrate rather than accept a wrong size.
+Always verify the finished file:
+
+```bash
+ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT"   # must equal the source
 ```
 
 To fix the audio on a video that is otherwise already finished, **do not
@@ -688,6 +1008,41 @@ video, not by re-encoding it.
 **Masked exit codes.** A background wrapper can report success while the real
 process was killed. Verify the output file exists and is non-empty.
 
+**Container corruption silently truncating a sequential read.** A damaged MKV can
+make the demuxer give up partway through — it stops, ffmpeg exits **0**, and you
+get a short file with no warning beyond an easily-ignored `invalid as first byte
+of an EBML number`. Non-empty is not enough; the file looks perfectly fine.
+
+Never trust a duration you did not compare:
+
+```bash
+ffprobe -v error -show_entries format=duration -of csv=p=0 "$MOVIE"   # container
+ffprobe -v error -show_entries format=duration -of csv=p=0 audio.wav  # extraction
+```
+
+Seeking usually reads straight past the bad point, so recover the tail rather
+than abandoning the file, and concatenate:
+
+```bash
+ffmpeg -y -v error -ss <truncation_point> -i "$MOVIE" -map 0:a:<idx> -vn \
+  -af "pan=mono|c0=c2" -ar 16000 -c:a pcm_s16le tail.wav
+printf "file '%s'\nfile '%s'\n" "$PWD/audio.wav" "$PWD/tail.wav" > concat.txt
+ffmpeg -y -v error -f concat -safe 0 -i concat.txt -c copy full.wav
+```
+
+**Prove the splice is time-accurate before building anything on it.** An MD5 of
+the spliced region against a direct read will differ for a harmless reason — the
+audio decoder primes differently after a seek — so compare *energy envelopes* and
+look for the lag, not byte equality. Zero lag with a sharp correlation peak means
+the timeline is intact; a mid-file window should come back at exactly 1.0 if the
+body was untouched. This distinction matters: a failing MD5 looks alarming and
+means nothing, while a 40 ms lag would silently mistime every cue after the join.
+
+The same trap applies at the far end of the pipeline: **after a hard burn, check
+the output duration against the source.** The stall is not deterministic — the
+same file may truncate an audio extraction and encode fully minutes later — so
+verify each time rather than assuming a previous result carries over.
+
 **Don't trust a running process as evidence of progress.** Check timestamps in
 the log, not just `pgrep`. A matching process may be a different stage, or a
 stale one.
@@ -710,13 +1065,24 @@ and always print what you dropped so it can be checked.
 a replacement written with literal spaces silently fails to match:
 
 ```python
-["Meuf, porc, poulet", "Boeuf, porc, poulet"]      # WRONG: misses "Meuf,\nporc, poulet"
-["Meuf,\\s+porc,\\s+poulet", "Boeuf, porc, poulet"]  # right
+["wrong word here", "right word here"]        # WRONG: misses "wrong\nword here"
+["wrong\\s+word\\s+here", "right word here"]  # right
 ```
 
-This fails *silently* -- apply_fixes.py reports the cues it did change, not the
-patterns that matched nothing. After applying, always grep the output for the
-old text to confirm each fix actually landed.
+Write `\s+` for **every** literal space by default. It costs nothing (it matches
+a single space too) and removes the whole failure class in one pass. Retro-fitting
+this to an existing fixes file is a one-line transform:
+
+```python
+pattern = pattern.replace(' ', '\\s+')
+```
+
+This fails *silently* — `apply_fixes.py` reports the cues it did change, not the
+patterns that matched nothing. Grepping the output for the old text is **not**
+sufficient to catch it, because the old text is wrapped there too and your grep
+misses it for the same reason the fix did. See "Verify every pattern landed, with
+newlines normalised" in Step 8 for the check that actually works, and note that
+patterns cannot cross a *cue* boundary at all.
 
 **Spell-checker artifacts.** A regex like `[a-zà-ÿ]+` silently strips capitals,
 turning `Habille` into `abille` and generating phantom errors. And hunspell
@@ -777,6 +1143,24 @@ language-neutral.
 ```bash
 brew install ffmpeg tesseract tesseract-lang hunspell
 uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install whisperx
+```
+
+**`brew install ffmpeg` is not enough for hard burn.** The core formula no longer
+bundles libass, so the `subtitles` and `ass` filters are absent and burn-in is
+impossible with that binary — everything else in this skill works fine. Confirm
+what you have before promising a burn:
+
+```bash
+ffmpeg -filters | grep -E '\bsubtitles\b|\bass\b'    # empty -> cannot burn
+```
+
+`ffmpeg-full` carries libass, fontconfig and freetype. It is **keg-only**, so it
+does not shadow `ffmpeg` on `PATH` and may already be installed without you
+noticing — check before installing anything, then call it by full path:
+
+```bash
+ls /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg
+FF=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg
 ```
 
 Hunspell dictionaries go in `~/Library/Spelling/` (macOS):
