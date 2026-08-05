@@ -57,19 +57,11 @@ Q3 for the numbers behind this.
 Because Metal makes `large-v3` cheap, the old speed-vs-accuracy trade is mostly
 gone: there is now no good reason to accept a worse model to save ten minutes.
 
-**Do not reach for `turbo` to save time.** It is a distilled decoder, and the
-accuracy it gives up lands precisely on the words that matter most — proper
-nouns and rare vocabulary — which are also the hardest for a human to spot and
-fix afterwards. Measured on the reference run, same audio, same settings:
-
-| | large-v3-turbo | large-v3 |
-|---|---|---|
-| "the Huns crossed the border" | `les eux` | `les Huns` (correct) |
-
-Every hour `turbo` saves is repaid several times over in manual review, because
-each surviving name error recurs throughout the film. Offer the faster models
-only if the user explicitly accepts a rougher result, and say plainly that the
-review burden grows.
+**Never use `turbo`.** Its distilled decoder gives up accuracy precisely on proper
+nouns and rare vocabulary — the words that matter most and are hardest to spot
+afterwards (measured on the reference run, same audio: `les eux` where `large-v3`
+read `les Huns`). On Metal it saves about seven minutes, so there is nothing to
+weigh.
 
 ### Measured speeds — use these to give the user an estimate
 
@@ -151,18 +143,22 @@ Three outcomes, and the user should understand the trade:
 - **No (default)** — just the `.srt` file. Players load it automatically when
   it sits beside the video with a matching filename.
 - **Soft-mux** — remux the subtitle track into the container. Fast, picture
-  untouched, toggleable in the player. Almost always what people actually want.
+  untouched, toggleable in the player.
 - **Hard burn (pixel-embed)** — subtitles painted into the picture. Requires a
   full video re-encode: lossy, permanent, and the file cannot be turned off.
   Roughly realtime with `libx264 -preset medium`, but ~9× realtime with a
-  hardware encoder. Only do this if the target device can't handle subtitle
-  tracks.
+  hardware encoder.
 
-Steer toward soft-mux if the user asks for burn-in without a specific reason.
+**Hard burn is a normal, common end state — expect to do it.** What it is not is
+the *next* step: because the re-encode is lossy and permanent, it comes after the
+user has worked through the uncertainties you flagged in Step 8 and is happy with
+the subtitle file. So take the answer here as a statement of intent, deliver the
+`.srt` (or soft-mux) first, and burn once the text is settled. Re-burning because
+a line changed costs a whole re-encode.
 
-If they do choose hard burn, three further answers change the command, so get
-them before starting — but get them **when you reach the burn**, not now, since
-they depend on the finished subtitle file and on probing the video:
+When you do reach the burn, three further answers change the command. Get them
+**then**, not now, since they depend on the finished subtitle file and on probing
+the video:
 
 - **font size**, as a fraction of frame height, and whether two-line cues may
   overlap the picture when the source is letterboxed
@@ -173,7 +169,7 @@ they depend on the finished subtitle file and on probing the video:
 See "Hard burn" in Step 10 for why the font size cannot be a fixed number.
 
 These three are the *minimum*. Ask more whenever an answer would change the
-plan — see "Asking the user is expected, not a fallback" in Step 8. Checking
+plan — see "The endgame is the user" in Step 8. Checking
 before a 1–2 hour transcription costs the user a moment; discovering the wrong
 assumption afterwards costs both of you the run.
 
@@ -750,10 +746,12 @@ adds nothing:
   the identical error the CTranslate2 `large-v3` run made, which had already
   been corrected by hand. A second Whisper pass
   will confidently agree with the first that `les Huns` is `les uns`.
-- **An independent but weak model adds nothing.** The wav2vec2 CTC pass (Pass D)
-  is architecturally unrelated and found 0 new errors, because a model with no
-  language model disagrees with Whisper nearly everywhere — and when disagreement
-  is the base rate, disagreement carries no information.
+- **An independent but weak model adds nothing.** A wav2vec2 CTC second pass is
+  architecturally unrelated to Whisper and found **0 new errors** while flagging a
+  third of all cues, because a model with no language model disagrees with Whisper
+  nearly everywhere — and when disagreement is the base rate, disagreement carries
+  no information. Validated against 14 known errors: it caught 7 and ranked none
+  of them in its top 50. Do not rebuild it.
 - **Canary-1B-v2 is the one that satisfies both** — NeMo FastConformer lineage
   (genuinely unrelated to Whisper) *and* strong French. It is the "individually
   strong, genuinely diverse second system" this section used to list as untested.
@@ -774,48 +772,6 @@ primary-wording source and Canary is the second opinion, rather than the reverse
 Spend the effort on Step 1 (synopsis) and Pass B (line-by-line) first. Both
 were measured to catch far more, for far less compute.
 
-### Pass D — wav2vec2 CTC cross-check (superseded, kept for the record)
-
-**Pass B now does this properly with Canary as the `CAN` source.** This pass was
-the earlier, weaker attempt at the same idea and is retained only because its
-measured failure is instructive — do not run it as well.
-
-The idea: transcribe the audio a second time with a *different model family*,
-and treat disagreement as a hint. Unlike a reference translation, this compares
-two readings of the same audio, so in principle it works inside songs and
-ad-libs. It is the right idea with a model too weak to deliver it.
-
-```bash
-python3 scripts/asr_ctc.py work/chunks work/ctc.json \
-  jonatasgrosman/wav2vec2-large-xlsr-53-french 6
-python3 scripts/cross_check.py draft.srt work/ctc.json work/chunks/cuts.txt --min-len 6
-```
-
-**Measured result on the reference run — read this before spending time on it.**
-Validated by running the detector against 14 errors already confirmed by other
-means:
-
-| | 30 s windows | 6 s windows |
-|---|---|---|
-| Known errors flagged | 7 / 14 | 7 / 14 |
-| Cues flagged (of 777) | 255 (33%) | 234 (30%) |
-| Known errors in top 50 | 0 | 1 |
-| **New errors found** | — | **0** |
-
-Half the known errors were missed, a third of all cues were flagged, and the
-highest-ranked suspects were ordinary correct words (`hommes`, `cheval`,
-`l'empereur`). The cause is structural: a CTC model has no language model, so
-its output diverges from Whisper's nearly everywhere. When disagreement is the
-base rate, disagreement carries little information.
-
-Do not run this expecting results. It is kept because it is cheap (~7 min for a
-90-minute film, since CTC is a single forward pass rather than autoregressive
-decoding) and might do better with a stronger second model — a French-fine-tuned
-Whisper, or a genuinely different family. **A second Whisper run is not a
-substitute**: same weights reproduce the same errors, which was confirmed here
-when whisper.cpp large-v3 independently produced `Chifou` for the character
-`Chi Fu` — the identical error the first pass had made.
-
 ### Validate any detector before you trust it
 
 The transferable lesson. Before believing a new error-detection technique,
@@ -825,103 +781,62 @@ and it is the only thing that separates a real check from a plausible-looking
 list. It cost one command here and prevented shipping a 234-cue list of noise
 as though it were diligence.
 
-### Asking the user is expected, not a fallback
+### The endgame is the user, and that is by design
 
-**A question is cheaper than a wrong guess, and cheaper than an hour of compute
-that finds nothing.** The user has the audio and can settle in thirty seconds
-what no amount of processing will resolve. Treat that as the design of the
-process, not an admission of failure.
-
-Concretely:
+Once the sources are exhausted, what remains are the lines where the dub says
+something no other text records — and on the reference run **every correction
+after that point came from the user listening.** A question is cheaper than a
+wrong guess and cheaper than an hour of compute that finds nothing. Treat it as
+the design of the process, not an admission of failure.
 
 - **Never invent a word to avoid asking.** A confident-looking wrong line is
-  worse than a flagged one, because the user will not think to check it. If the
-  evidence does not decide it, it goes in the table.
+  worse than a flagged one, because the user will not think to check it.
 - **Never run more compute purely to avoid asking.** On the reference run an
   extra cross-check pass cost ~30 minutes and found nothing that four listening
-  questions had not already settled. If the next useful step is a listen, ask.
-- **Ask early when the answer changes the plan**, not only at the end:
-  - no reference track in the file → ask *before* the 1–2 h transcription, since
-    the user may have a subtitle file that changes the whole verification stage
-  - the user reports vague "imperfections" → ask whether they mean wrong words,
-    timing, or line breaks; these have entirely different fixes
-  - low disk space, or a model choice that trades hours against accuracy
-- **Expect several rounds, and say so.** The loop that works is: hand over a
-  table → the user answers a few → apply them → the answers often reveal
-  adjacent errors → hand over a smaller table. On the reference run this ran
-  four times and produced the last dozen corrections. Do not present the first
-  table as final.
-- **Batch the questions.** One consolidated table the user can work through
-  linearly, not a question every few minutes.
-- **Make answering cheap.** Give a timestamp they can type into a player, quote
-  what the ASR heard, and say what is happening in the scene. If a whole line is
-  garbled, ask for the whole line rather than one word.
+  questions had not already settled.
+- **Ask early when the answer changes the plan**, not only at the end: no
+  reference track (ask *before* transcribing — they may have a subtitle file);
+  vague reports of "imperfections" (wrong words, timing and line breaks have
+  entirely different fixes).
+- **Expect several rounds.** Hand over a table → the user answers a few → apply
+  → the answers reveal adjacent errors → hand over a smaller table. This ran
+  four times on the reference run. Do not present the first table as final.
 - **Apply answers verbatim.** The user heard the audio; you did not. If their
-  wording implies an adjacent cue is also wrong, say so and ask — do not silently
-  extend the fix.
+  wording implies an adjacent cue is also wrong, ask — do not silently extend it.
 
-### Hand the remainder to the user
+Present the remainder as one batched table, sorted by timestamp so the user can
+work through the film linearly, with `HH:MM:SS` they can type into a player and a
+**Context** column saying what happens in the scene — that is usually what lets
+them recognise the line without hunting. Group by ease: short isolated shouts
+first, mid-sentence errors next, sung lines last.
 
-Whatever you could not resolve, present as a table so the user can check it
-against the audio in one pass. Always these four columns:
-
-| Time | Whisper heard | Transcript says | Context |
+| Time | Whisper heard | Reference says | Context |
 |---|---|---|---|
-| 00:28:05 | `un vrai purson` | *Torride, non ?* | Mushu boasting after a fire trick |
-| 00:46:38 | `Kenny ! McKay !` | *Gengis Khanasson...* | Mushu naming the horse; likely a joke name |
+| 00:28:05 | `un vrai purson` | *Torride, non ?* | Boasting after a fire trick — was `pur-sang` |
+| 00:46:38 | `Kenny ! McKay !` | *Gengis Khanasson...* | Naming the horse; likely a joke name |
 | 00:56:13 | `Monkey !` | *(no reference cue)* | Shouted during the battle |
 
-Sort by timestamp so the user can work through the film linearly. Give the
-timestamp in `HH:MM:SS` so it can be typed straight into a player. In
-**Context**, say what is happening in the scene — that is usually what lets the
-user recognise the line without hunting for it.
+**Do not tell the user which items to skip.** Marking a few as "probably a
+deliberate dub invention, don't waste time" is unreliable in exactly the cases
+where it feels safest: on the reference run three items were confidently set
+aside as intentional malapropisms and **all three were wrong** — each a
+*different* malapropism from the one the ASR produced, which no amount of reading
+could have revealed. The user resolved all three in seconds once simply listed.
+Offer a hypothesis as a suggested-reading column, never as a reason not to check.
 
-Group by ease: short isolated shouts first, mid-sentence errors next, sung lines
-last.
+**Expect your own confident fixes to be wrong in a specific direction.**
+Corrections are safe when they restore a fixed idiom or a glossary name, and much
+weaker when the reference merely *implies* a meaning — the dub may render the same
+joke in entirely different words, and a plausible reconstruction reads fine while
+being wrong. The recurring shapes, all of them ordinary: a real word heard as a
+non-word (`purson` → `pur-sang`, `refiant` → `rufian`), an insult heard as a name
+(`Blorbeck` → `blanc-bec`), a synonym in the reference (`Petite maladroite` for
+`Petite empotée`), or the dub inventing its own insult (`porc aigre doux` where
+the reference has *nouille molle*). Prefer flagging over reconstructing whenever
+the evidence is semantic rather than lexical.
 
-**Do not tell the user which items to skip.** It is tempting to mark a few as
-"probably correct — a deliberate dub invention, don't waste time on these". That
-call is unreliable in exactly the cases where it feels safest. In the reference
-run three items were confidently set aside as intentional malapropisms and **all
-three were wrong** — each was a *different* malapropism from the one the ASR had
-produced, which no amount of reading could have revealed. The user resolved all
-three in seconds once they were simply listed.
-
-List every unresolved line plainly and let the user's ears decide. If you have a
-hypothesis, offer it as the suggested reading in its own column rather than as a
-reason not to check.
-
-**Expect your own confident fixes to be wrong too, in a specific direction.**
-Corrections derived from the reference are safe when they restore a fixed idiom
-or a glossary name. They are much weaker when the reference merely *implies* a
-meaning: the dub may render the same joke with entirely different words, and a
-plausible reconstruction will read fine while being wrong. Prefer flagging over
-reconstructing whenever the evidence is semantic rather than lexical.
-
-### The endgame is the user, and that is fine
-
-Once the reference, the dictionary and the synopsis are exhausted, the remaining
-errors are the ones where the dub says something no other text records. On the
-reference run **every correction after that point came from the user listening.**
-The pattern to recognise — in each case the reference proved the line was wrong
-and could not say what was right, because it was a different translation:
-
-| ASR produced | Actually said | Reference said | Why it was stuck |
-|---|---|---|---|
-| `purson` (non-word) | `pur-sang` | *Torride, non ?* | Reference paraphrased the joke entirely |
-| `refiant` (non-word) | `rufian` | *Canailles insubordonnées !* | Same insult, different word |
-| `Blorbeck` | `blanc-bec` | *vermisseau !* | An insult misheard as a name |
-| `Petit en petit` | `Petite empotée` | *Petite maladroite !* | Synonym, not the same word |
-| garbled clause | `porc aigre doux` | *nouille molle !* | Dub invents its own insult |
-
-Note that none of these are exotic. Each is a common class: a real word heard as
-a non-word, an insult heard as a name, a synonym in the reference. Expect them
-in any film.
-
-Do not treat that as a shortfall to hide or grind against with more compute.
-Deliver a short, well-ordered review table and say plainly that these need ears.
-A precise 10-line table is worth more to the user than another hour of
-processing that finds nothing.
+A precise 10-line table is worth more to the user than another hour of processing
+that finds nothing.
 
 ---
 
@@ -1024,7 +939,7 @@ ffmpeg -y -i "$MOVIE" -i final.srt -map 0:v:0 -map 0:a:0 -map 1 \
   -c:s srt -metadata:s:s:0 language=fra "output.mkv"
 ```
 
-### Hard burn (only if the user explicitly chose it — slow, lossy, permanent)
+### Hard burn (do it once the subtitle text is settled — lossy and permanent)
 
 **First check that ffmpeg can render subtitles at all.** Both the `subtitles`
 and `ass` filters come from libass, and plenty of builds ship without it —
@@ -1239,28 +1154,16 @@ ffprobe -v error -show_entries format=duration -of csv=p=0 "$MOVIE"   # containe
 ffprobe -v error -show_entries format=duration -of csv=p=0 audio.wav  # extraction
 ```
 
-Seeking usually reads straight past the bad point, so recover the tail rather
-than abandoning the file, and concatenate:
+Seeking usually reads straight past the bad point, so recover the tail with
+`-ss <truncation_point>`, concatenate it onto the good part, and **prove the
+splice is time-accurate before building anything on it** — every cue after the
+join depends on it. Compare energy envelopes and look for the lag; do not compare
+MD5s, which differ for a harmless reason (the decoder primes differently after a
+seek) and will send you chasing nothing.
 
-```bash
-ffmpeg -y -v error -ss <truncation_point> -i "$MOVIE" -map 0:a:<idx> -vn \
-  -af "pan=mono|c0=c2" -ar 16000 -c:a pcm_s16le tail.wav
-printf "file '%s'\nfile '%s'\n" "$PWD/audio.wav" "$PWD/tail.wav" > concat.txt
-ffmpeg -y -v error -f concat -safe 0 -i concat.txt -c copy full.wav
-```
-
-**Prove the splice is time-accurate before building anything on it.** An MD5 of
-the spliced region against a direct read will differ for a harmless reason — the
-audio decoder primes differently after a seek — so compare *energy envelopes* and
-look for the lag, not byte equality. Zero lag with a sharp correlation peak means
-the timeline is intact; a mid-file window should come back at exactly 1.0 if the
-body was untouched. This distinction matters: a failing MD5 looks alarming and
-means nothing, while a 40 ms lag would silently mistime every cue after the join.
-
-The same trap applies at the far end of the pipeline: **after a hard burn, check
-the output duration against the source.** The stall is not deterministic — the
-same file may truncate an audio extraction and encode fully minutes later — so
-verify each time rather than assuming a previous result carries over.
+The same trap applies at the far end: **after a hard burn, check the output
+duration against the source.** The stall is not deterministic — the same file may
+truncate an extraction and encode fully minutes later — so verify every time.
 
 **Don't trust a running process as evidence of progress.** Check timestamps in
 the log, not just `pgrep`. A matching process may be a different stage, or a
@@ -1326,8 +1229,6 @@ All under `scripts/`, all take explicit arguments, none hardcode paths.
 | `find_suspects.py` | Dictionary check to surface candidate errors |
 | `review_pairs.py` | Draft vs every source (`CAN`/`REF`/`EN`) for line-by-line review |
 | `run_canary.py` | Independent second transcript from Canary-1B-v2 on Metal |
-| `asr_ctc.py` | Superseded by `run_canary.py`; wav2vec2 CTC second opinion |
-| `cross_check.py` | Superseded; flags words a CTC pass did not confirm (low-yield) |
 | `adjudicate.py` | Show reference text at a suspect's timecode |
 | `apply_fixes.py` | Apply text fixes; asserts timings unchanged |
 | `qa_srt.py` | Structural, readability and coverage QA |
@@ -1351,9 +1252,9 @@ Two things that are genuinely language-specific, not just a code:
 - **Punctuation spacing.** French puts a space before `! ? ; :`; English does
   not. `SPACE_BEFORE` in `build_srt.py` and `fix_ocr.py` holds the set of
   languages that do — add yours if needed.
-- **The stopword and determiner lists** in `cross_check.py` and any
-  sentence-boundary logic are French. For another language, replace them or the
-  heuristics will misfire. They are small and self-contained.
+- **Stopword, determiner and sentence-boundary logic** in the scripts is French.
+  For another language, replace it or the heuristics will misfire. It is small
+  and self-contained.
 
 Everything else — chunking, alignment, cue building, the QA checks — is
 language-neutral.
