@@ -6,6 +6,9 @@
     # the three-source read this pipeline is built around:
     review_pairs.py draft.srt 1 150 CAN=canary.srt REF=reference.srt WEB=web.srt
 
+    # add FRW when Step 5c ran (French audio only):
+    review_pairs.py draft.srt 1 150 CAN=canary.srt FRW=french.srt REF=reference.srt
+
     # legacy two-argument form, still accepted:
     review_pairs.py draft.srt reference.srt 1 150
 
@@ -21,6 +24,10 @@ Each source answers a different question, and they are not interchangeable:
        agrees with ASR the line is almost certainly right, and when it differs
        the audio is genuinely ambiguous. Its cues are fixed windows, not speech
        boundaries -- never take timing from it.
+  FRW  large-v3-french transcript (Step 5c, French only). A Whisper fine-tune, so
+       NOT an independent listener -- agreement with ASR proves little. Consult it
+       where ASR has "..." or nothing over obvious dialogue: it recovers speech the
+       others drop. Prone to long repetition loops; never take timing from it.
   REF  Subtitle track from the movie file, in the dub language. A different
        translation of the same scene: a strong error *detector*, a weak error
        *corrector*.
