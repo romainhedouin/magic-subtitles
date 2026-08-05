@@ -75,6 +75,7 @@ extraction.
 | Model | Runtime | × realtime | 2 h film | Own timestamps? |
 |---|---|---|---|---|
 | `large-v3` | **`mlx-whisper` (Metal)** | **7.3×** | **~16 min** | Yes, segment-level |
+| `large-v3-french` | `mlx-whisper` (Metal) | 7.1× | ~17 min | Yes, but 69 cues >20 s |
 | `large-v3` | WhisperX (CPU) | ~0.8–1.5× | 1.5–3 h | Yes, segment-level |
 | Canary-1B-v2 | `mlx-audio` (Metal) | **15×** | ~8 min | **No — all zeros** |
 | Parakeet TDT 0.6B v3 | `parakeet-mlx` (Metal) | 33× | ~3.5 min | Yes, incl. word-level |
@@ -386,6 +387,10 @@ primary wording; Canary is an architecturally independent second listener, and
 where the two agree a line needs no further thought. Together they cost about
 25 minutes for a 2-hour film on Metal, which is less than the old single CPU pass.
 
+There is an **optional third pass** (Step 5c), French audio only. It is a Whisper
+fine-tune, so it is *not* a third independent vote — it earns its place by
+transcribing speech the other two drop, not by breaking ties.
+
 Split the audio once, on silence, so no cut lands mid-word — both passes reuse it:
 
 ```bash
@@ -458,6 +463,75 @@ no warning). It checkpoints per window and resumes.
 characteristic failure is decoder repetition inside a window
 (`Escorte. Escorte. Escorte.`) — repetition in `CAN` means "ignore this window",
 not "the dub repeats itself".
+
+### 5c. `large-v3-french`, the coverage pass (French audio, optional)
+
+```bash
+bash scripts/setup_whisper_fr.sh          # one-time, ~10 min, builds the MLX model
+```
+
+```bash
+mlx_whisper audio.wav \
+  --model "$HOME/.cache/whisper-mlx/whisper-large-v3-french" --language fr \
+  --condition-on-previous-text False --hallucination-silence-threshold 2 \
+  --output-format srt --output-dir . --output-name french
+```
+
+(`--output-name` takes the stem, not the filename — it appends `.srt` itself.)
+
+`bofenghuang/whisper-large-v3-french` is a full fine-tune of `large-v3` (32
+layers, `n_vocab` 51866 — not a distil variant). Same runtime, same flags, same
+~17 min for a 2-hour film as Step 5a. Run it on the **whole** `audio.wav`, not the
+chunks: its output never reaches the alignment stage, so per-chunk SRTs buy
+nothing here, and the anti-loop flags are still mandatory — it loops worse than
+`large-v3`, not better.
+
+**Read this before deciding to run it.** Measured head-to-head against Step 5a on
+the same French film (*Intouchables*, 1 h 52 m, identical audio and flags):
+
+| | `large-v3` | `large-v3-french` |
+|---|---|---|
+| Words transcribed | 10 225 | **10 635** |
+| Speech duration covered | 74.2 min | **83.3 min** |
+| Empty `...` filler cues | 83 | **0** |
+| `Abonnez vous` hallucinations | 5 | **1** |
+| Cues stuck in a repetition loop | **5** | 16 |
+| Worst loop | 7× | **112×** (`Ah ! Ah ! Ah !…`) |
+| Cues over 20 s | **35** | 69 |
+| Cues total | 1890 | 964 |
+
+Only 39% of aligned blocks came back identical, so it disagrees with Step 5a
+constantly — 2 761 words changed across the 424 differing blocks.
+
+**What it is good for.** It recovers whole exchanges that `large-v3` threw away as
+`...` filler — the single largest win, and exactly the class of miss Pass B is
+expensive to catch by hand:
+
+| Time | `large-v3` | `large-v3-french` |
+|---|---|---|
+| 00:06:59 | `... ...` Ça va aller ? | On l'a prévenu, y a un brancard qui arrive dans une 2nde. On vous laisse là, ça va aller ? |
+| 01:17:45 | Ah d'accord. D'accord, y'a pas de soucis. `...` | Allô, Dries. Qu'est-ce que vous faites ? Je vous dérange ? … Vous voulez vous barrer, c'est ça ? |
+
+It is also better on French mechanics: `faut qu'on voie` not `faut qu'on voit`,
+`s'il n'est pas` not `s'il est pas`, `6 mois` not `Six mois`, `kilomètres` not `km`.
+
+**What disqualifies it as a primary pass.** It loops far harder than `large-v3`
+*with the identical anti-loop flags* — 112 consecutive `Ah !` swallowed a real
+exchange about phantom pain at 00:42:09, and at 01:23:38 an entire scene came back
+as the single cue `Sous-titrage MFP.` It also emits half as many cues covering
+*more* speech, so 69 cues run over 20 s — the same mega-cue failure that got
+Parakeet rejected above.
+
+So: **`french.srt` is a wording and coverage source, never a timing source, and
+never an independence vote.** It shares `large-v3`'s weights, so when it agrees
+with Step 5a that agreement is worth much less than Canary agreeing — see the
+independence rule under "On running several models". Pass it to Pass B as `FRW`,
+and treat a `FRW`-only line the way you treat any single-source claim: as a lead
+to verify, not a correction to apply.
+
+**Skip it** when the audio is not French — there is no equivalent fine-tune wired
+up for other languages, and pointing this step at non-French audio just gives you
+`large-v3` with extra steps.
 
 ---
 
@@ -585,14 +659,15 @@ comfortably in context:
 
 ```bash
 python3 scripts/review_pairs.py draft.srt 1 150 \
-  CAN=canary.srt REF=reference.srt WEB=web.srt
+  CAN=canary.srt FRW=french.srt REF=reference.srt WEB=web.srt
 python3 scripts/review_pairs.py draft.srt 151 300 \
-  CAN=canary.srt REF=reference.srt WEB=web.srt
+  CAN=canary.srt FRW=french.srt REF=reference.srt WEB=web.srt
 # ... continue to the end; each run prints the next batch's command
 ```
 
 Every source you obtained must be passed. Omit `REF` if the film had no in-file
-track, or `WEB` if the search genuinely failed, but never omit `CAN`.
+track, `WEB` if the search genuinely failed, or `FRW` if you skipped Step 5c, but
+never omit `CAN`.
 
 **How to weigh the voices.** Each answers a different question, and confusing them
 is how false corrections get made:
@@ -601,12 +676,23 @@ is how false corrections get made:
 |---|---|---|
 | `ASR` (Whisper) | **Timing**, and the wording being judged | — |
 | `CAN` (Canary) | What was **said** — an independent listen | Timing (30 s windows) |
+| `FRW` (large-v3-french) | **Speech the others missed**; French mechanics | Timing (mega-cues); independence |
 | `REF` (in-file subtitle) | **Whether** a line is wrong; meaning | Exact wording |
 | `WEB` (online subtitle) | **Proper-noun spellings**; scene meaning | Any wording choice; timing |
 
 `REF` and `WEB` are **not** independent of each other — both are typically
 translations of the same English script — so their agreement is weak evidence
-about the dub. Only `ASR` and `CAN` are genuine witnesses to the audio.
+about the dub. Neither is `FRW` independent of `ASR`: it is a fine-tune of the
+same weights, so `ASR`+`FRW` agreement is close to one witness speaking twice.
+Only `ASR` and `CAN` are genuine independent witnesses to the audio.
+
+**Where `FRW` changes the procedure:** it does not get a vote in steps 1–3 below.
+Use it in one place only — when `ASR` shows `...`, a suspiciously short line, or
+nothing at a timecode where the film clearly has dialogue, check `FRW` for the
+words. That is the case it measurably wins (+9 minutes of recovered speech). When
+`FRW` supplies a line no other source has, verify it against `REF`/`WEB` for
+meaning before accepting: it is also the source most prone to inventing a
+112-times repetition or a `Sous-titrage MFP.` where a whole scene should be.
 
 Read them as a decision procedure, in this order:
 
@@ -758,6 +844,15 @@ adds nothing:
   Measured against Parakeet TDT v3 on the same French film, Canary read
   `Ça y est, les voilà` and `100 euros que je les mets dans le vent` where Parakeet
   read `Dégage toi les voilà` and `100 euros que les mettre dans le nom`.
+- **A same-family fine-tune buys coverage, not independence.**
+  `bofenghuang/whisper-large-v3-french` (Step 5c) is a `large-v3` fine-tune, so the
+  rule above applies in full: its agreement with Step 5a is nearly worthless as
+  corroboration. What it does buy, measured on the same French film, is **+410
+  words and +9 minutes of speech** that `large-v3` emitted as `...` filler, plus
+  correct French mechanics (`faut qu'on voie`, `6 mois`, `kilomètres`). It pays for
+  itself as a *coverage* source and must never be scored as a third vote. Its cost
+  is real: 16 looping cues against `large-v3`'s 5, one of them 112× `Ah !`, and 69
+  cues over 20 s. Third pass, optional, French only.
 - **Do not run them concurrently on CPU.** CTranslate2 already saturates the
   cores; parallel runs are proportionally slower each with no wall-clock gain.
   On Metal this no longer applies, but run them sequentially anyway — each pass
@@ -1227,8 +1322,9 @@ All under `scripts/`, all take explicit arguments, none hardcode paths.
 | `align_words.py` | Alignment-only pass for word-level timings |
 | `build_srt.py` | Rebuild cues with real subtitle constraints |
 | `find_suspects.py` | Dictionary check to surface candidate errors |
-| `review_pairs.py` | Draft vs every source (`CAN`/`REF`/`EN`) for line-by-line review |
+| `review_pairs.py` | Draft vs every source (`CAN`/`FRW`/`REF`/`EN`) for line-by-line review |
 | `run_canary.py` | Independent second transcript from Canary-1B-v2 on Metal |
+| `setup_whisper_fr.sh` | One-time build of the `large-v3-french` MLX model (Step 5c) |
 | `adjudicate.py` | Show reference text at a suspect's timecode |
 | `apply_fixes.py` | Apply text fixes; asserts timings unchanged |
 | `qa_srt.py` | Structural, readability and coverage QA |
@@ -1265,6 +1361,7 @@ language-neutral.
 brew install ffmpeg tesseract tesseract-lang hunspell
 uv tool install mlx-whisper     # Step 5a, Metal
 uv tool install mlx-audio       # Step 5b, Canary-1B-v2
+bash scripts/setup_whisper_fr.sh  # Step 5c, optional, French only (~10 min, 3 GB)
 # CPU fallback only, if MLX/Metal is unavailable:
 uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install whisperx
 ```
@@ -1272,6 +1369,11 @@ uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install whisp
 `mlx-audio` installs its own interpreter; call `run_canary.py` with it rather than
 the project venv: `"$(uv tool dir)/mlx-audio/bin/python" scripts/run_canary.py ...`.
 Both MLX packages need Apple Silicon. Each model downloads ~2–3 GB on first use.
+`setup_whisper_fr.sh` is only needed for Step 5c; it builds into
+`~/.cache/whisper-mlx/` once and is a no-op on re-run. There is no published MLX
+build of that model, so the script converts it — and works around a HuggingFace
+Xet transfer that stalls on this repo and a weights-filename mismatch. Read its
+header before changing how it downloads.
 `align_words.py` (Step 6) still needs the whisperx venv — it uses wav2vec2, not MLX.
 
 **`brew install ffmpeg` is not enough for hard burn.** The core formula no longer
