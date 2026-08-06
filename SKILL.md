@@ -1172,8 +1172,9 @@ different things depending on the source:
 | 1080p | x3.75 | **~90 px** |
 | 4K    | x7.5  | ~180 px |
 
-A bare `FontSize=24` is therefore meaningless on its own, and on 1080p it is
-roughly double a normal subtitle. **Do not carry a fixed number between films.**
+A bare `FontSize=24` is therefore meaningless on its own — the same number lands
+at 60 px, 90 px or 180 px depending only on the source resolution.
+**Do not carry a fixed number between films.**
 
 The fix is to stop working in the synthetic 288-line space. Convert to ASS,
 rewrite `PlayRes` to the real frame size, and then the number *is* pixels:
@@ -1187,18 +1188,36 @@ sed -i '' -e "s/^PlayResX: .*/PlayResX: $W/" -e "s/^PlayResY: .*/PlayResY: $H/" 
 
 Then size relative to the frame, since that is what actually scales:
 
-- **font ≈ 4.5–5% of frame height** — 1080p → 49–54 px, 720p → 32–36 px, 4K → 97–108 px
-- **outline ≈ 6% of the font** (~3 px at 1080p). The ASS default `Outline 1` was
+- **font ≈ 6–7.5% of frame height** — 1080p → 64–80 px, 720p → 43–54 px,
+  4K → 130–162 px. Offer the user three candidates across that band and default
+  to the middle (~6.7%, i.e. **72 px at 1080p**).
+- **outline ≈ 6% of the font** (4–5 px at 1080p). The ASS default `Outline 1` was
   chosen for a 288-line script; left alone it is a hairline that disappears
-  against bright scenes.
+  against bright scenes. Scale it with the font — a 3 px outline that looked
+  right at 54 px reads as thin at 72 px.
 - **MarginV ≈ 4–5% of frame height** (~50 px at 1080p). The default `10` sits
   almost on the frame edge once PlayResY is the real height.
 - Bold (`-1` in the style's Bold field) reads better over moving picture.
 
 ```
-Style: Default,Arial,52,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,1.5,2,60,60,54,1
-                        ^font                                       ^bold                      ^outline    ^marginV
+Style: Default,Arial,72,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,2,60,60,50,1
+                        ^font                                       ^bold                      ^outline  ^marginV
 ```
+
+**Why this band and not the smaller broadcast norm.** Textbook subtitling sits
+around 4.5–5% of frame height, which is tuned for cinema and for viewers close to
+the screen. On a living-room TV it reads as small. Measured on a 1072-high frame,
+the cost of going bigger is modest and worth stating to the user in pixels:
+
+| Font | % of height | Two-line ink | Covers bottom |
+|---|---|---|---|
+| 54 px | 5.0% | 88 px | 13.9% |
+| **72 px** | **6.7%** | 118 px | **17.0%** |
+
+Three extra percentage points of picture for a substantially more comfortable
+read. Users who have compared the two side by side have preferred the larger.
+Still offer the choice — it is a taste call, and someone sitting close to a
+monitor may genuinely want 4.5%.
 
 Burn the ASS (not the SRT), so the styling is explicit and reproducible:
 
