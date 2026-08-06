@@ -661,6 +661,28 @@ python3 scripts/review_pairs.py draft.srt 151 300 \
 Every source you obtained must be passed. Omit `REF` if the film had no in-file
 track or `WEB` if the search genuinely failed, but never omit `CAN` or `QWN`.
 
+`review_pairs.py` sequence-aligns each cue's words against the overlapping window
+of every independent ASR and marks any word none of them supports `[[like this]]`,
+then tiers the cues by how many models dissent. Read the `!!` tier closely.
+
+```bash
+# what to look at first, whole film, highest-signal cues only
+python3 scripts/review_pairs.py draft.srt 1 9999 \
+  CAN=canary.srt QWN=qwen3.srt REF=reference.srt --rank --tier both
+```
+
+**Do not filter by whole-cue similarity.** It inverts the priority. A homophone
+swap — the error class this pass exists to catch — changes one token in four and
+scores ~25% divergence, below any sensible threshold, while merely garbled cues
+score high and crowd it out. On the reference run a 60%-divergence filter hid
+`Smith la rencontrera` (for `leur en causera`) completely, and the line shipped.
+Word-level alignment with no threshold caught it, and measured against 21
+confirmed corrections the `!!` tier held 17 of them (81% recall) at 21% of cues.
+
+It is a **ranking, not a filter**: four known errors fell outside it — two where
+both models garbled the same noisy passage, two where both agreed with the wrong
+reading. Still read every cue; the tier decides how hard.
+
 **How to weigh the voices.** Each answers a different question, and confusing them
 is how false corrections get made:
 
@@ -978,6 +1000,22 @@ something no other text records — and on the reference run **every correction
 after that point came from the user listening.** A question is cheaper than a
 wrong guess and cheaper than an hour of compute that finds nothing. Treat it as
 the design of the process, not an admission of failure.
+
+**Write findings down as you read them, not afterwards.** Use
+`scripts/findings.py`: every flagged cue gets one appended line the moment you
+judge it, with a verdict of `fix`, `ask` or `dismiss`. The user table and the
+fixes file are then *generated* from that ledger, and `findings.py check`
+enforces the accounting identity
+
+    flagged == fix + ask + dismiss
+
+refusing to balance if any flagged cue was never dispositioned. This is not
+bureaucracy. On the reference run a cue was correctly identified as wrong during
+Pass B — the reference disagreed, the note "probably `leur en causera`" was
+made — and then never reached the user table, because it lived only in working
+memory between reading the batch and writing the table at the end. Nothing was
+careless; there was simply no record. Generating the deliverables from a ledger
+makes that failure structurally impossible instead of a matter of diligence.
 
 - **Never invent a word to avoid asking.** A confident-looking wrong line is
   worse than a flagged one, because the user will not think to check it.
@@ -1436,7 +1474,8 @@ All under `scripts/`, all take explicit arguments, none hardcode paths.
 | `align_words.py` | Alignment-only pass for word-level timings |
 | `build_srt.py` | Rebuild cues with real subtitle constraints |
 | `find_suspects.py` | Dictionary check to surface candidate errors |
-| `review_pairs.py` | Draft vs every source (`CAN`/`QWN`/`REF`/`WEB`) for line-by-line review |
+| `review_pairs.py` | Draft vs every source, word-level disagreement marking and tiering |
+| `findings.py` | Pass B ledger; generates the user table and fixes file, enforces the balance |
 | `run_canary.py` | Independent second transcript from Canary-1B-v2 on Metal |
 | `run_qwen3.py` | Independent third transcript from Qwen3-ASR-1.7B on Metal |
 | `fix_sentence_breaks.py` | Step 9: find and repair unpunctuated sentence starts |
