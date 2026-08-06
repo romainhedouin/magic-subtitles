@@ -56,3 +56,16 @@ A 88-minute animated film, French dub, on an M4 Mac:
 Weakest area: musical numbers, where sung vocals defeat voice-activity
 detection and the two translations diverge most, so fewer errors can be
 confirmed. The skill reports what it could not verify rather than guessing.
+
+## Development
+
+The scripts are linted with [ruff](https://docs.astral.sh/ruff/); see
+`ruff.toml` for the (deliberately narrow) rule set.
+
+```bash
+uvx ruff check scripts/
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
