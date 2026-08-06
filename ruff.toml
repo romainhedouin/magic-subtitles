@@ -1,0 +1,12 @@
+# Linting for scripts/. Deliberately narrow: these are small, self-contained
+# tools driven by the skill, so the gate catches real defects (undefined names,
+# unused imports, syntax errors) and leaves working code alone.
+line-length = 100
+
+[lint]
+select = ["E", "F"]
+ignore = [
+    "E741",  # short loop names like `l` for a subtitle line read fine here
+    "E702",  # a few deliberate one-line statement pairs
+    "E731",  # one lambda assignment in pgs_to_srt.py
+]
