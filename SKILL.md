@@ -1,6 +1,6 @@
 ---
 name: magic-subtitles
-description: Generate subtitles that match a film's dubbed audio, transcribing twice with two independent model families (Whisper large-v3 on Metal and NVIDIA Canary-1B-v2) plus forced alignment, then correcting the result against target-language reference subtitles. Use when a user wants accurate subtitles for a movie, wants subtitles matching what the voices actually say (rather than a translation of the original script), or wants to fix badly-timed or mistranslated subtitles.
+description: Generate subtitles that match a film's dubbed audio, transcribing three times with three independent model families (Whisper large-v3 on Metal, NVIDIA Canary-1B-v2, and Qwen3-ASR-1.7B) plus wav2vec2 forced alignment, then correcting the result against target-language reference subtitles. Use when a user wants accurate subtitles for a movie, wants subtitles matching what the voices actually say (rather than a translation of the original script), or wants to fix badly-timed or mistranslated subtitles.
 ---
 
 # Magic Subtitles
@@ -19,18 +19,29 @@ illustrate the *shape* of each problem, not facts about that film. Expect the
 same shapes in any film and language: invented names, homophone swaps, a fixed
 idiom broken, an insult heard as a proper noun.
 
-The core idea: **transcribe the audio twice with two unrelated model families,
-then correct the result against human subtitles in the same language.** Whisper
-`large-v3` (on Metal) supplies the timing and the primary wording; NVIDIA
-Canary-1B-v2 is an independent second listener, so where the two agree a line
-needs no further thought and where they differ you have found the exact places
-the audio is ambiguous. The subtitle files — the track inside the movie file, plus
-one fetched online — are human translations timecoded to a real release; they tell
-you what a scene *means* and how every proper noun is *spelled*.
+The core idea: **transcribe the audio three times with three unrelated model
+families, then correct the result against human subtitles in the same language.**
+Whisper `large-v3` (on Metal) supplies the timing and the primary wording;
+NVIDIA Canary-1B-v2 and Qwen3-ASR-1.7B are independent second and third
+listeners, so where they agree a line needs no further thought and where they
+differ you have found the exact places the audio is ambiguous. A fourth model,
+wav2vec2, never transcribes at all — it only forced-aligns the chosen words to
+recover per-word timings. The subtitle files — the track inside the movie file,
+plus one fetched online — are human translations timecoded to a real release;
+they tell you what a scene *means* and how every proper noun is *spelled*.
 
-Four sources, each authoritative about something different, none authoritative
+Five sources, each authoritative about something different, none authoritative
 about everything. Step 4 sets out which is which, and Pass B in Step 8 is where
 they are read against each other line by line.
+
+**The four models, and the one job each does:**
+
+| Model | Job | Never used for |
+|---|---|---|
+| `whisper-large-v3-mlx` | Timing + primary wording | — |
+| `Canary-1B-v2` | Independent second listen | Timing (30 s windows) |
+| `Qwen3-ASR-1.7B` | Independent third listen | Timing (window bounds) |
+| `wav2vec2-large-xlsr-53-<lang>` | Word-level forced alignment | Wording — it cannot change a word |
 
 ---
 
@@ -75,9 +86,9 @@ extraction.
 | Model | Runtime | × realtime | 2 h film | Own timestamps? |
 |---|---|---|---|---|
 | `large-v3` | **`mlx-whisper` (Metal)** | **7.3×** | **~16 min** | Yes, segment-level |
-| `large-v3-french` | `mlx-whisper` (Metal) | 7.1× | ~17 min | Yes, but 69 cues >20 s |
 | `large-v3` | WhisperX (CPU) | ~0.8–1.5× | 1.5–3 h | Yes, segment-level |
 | Canary-1B-v2 | `mlx-audio` (Metal) | **15×** | ~8 min | **No — all zeros** |
+| Qwen3-ASR-1.7B | `mlx-audio` (Metal) | ~7× | ~17 min | **No — one segment per call** |
 | Parakeet TDT 0.6B v3 | `parakeet-mlx` (Metal) | 33× | ~3.5 min | Yes, incl. word-level |
 
 The 7.3× for `mlx-whisper` **depends on the anti-loop flags** in Step 5a. Without
@@ -167,7 +178,7 @@ the video:
   quality per byte)
 - **size budget**, which is how you calibrate a hardware encoder's bitrate
 
-See "Hard burn" in Step 10 for why the font size cannot be a fixed number.
+See "Hard burn" in Step 12 for why the font size cannot be a fixed number.
 
 These three are the *minimum*. Ask more whenever an answer would change the
 plan — see "The endgame is the user" in Step 8. Checking
@@ -332,14 +343,14 @@ false corrections come from:
   most reliable thing a web subtitle gives you. ASR spells names phonetically
   (`Salut, chienne peau` for `Chien-Po`); the subtitle has the canonical spelling
   of every character, place and brand.
-- **Strong on meaning.** When the two ASR passes produce plausible-but-different
+- **Strong on meaning.** When the ASR passes produce plausible-but-different
   French, the subtitle line usually makes it obvious which reading fits the scene.
 - **Weak on wording.** It cannot settle a choice between two French readings that
   mean the same thing. Do not let it.
 - **Useless as timing.** It is timed to *some* release, not necessarily yours. Use
   it as a **drift check** (does dialogue start at about the same time at 10 min,
   60 min, 100 min?) and never as a timing source. See "Validate timing by drift,
-  not by offset" in Step 9.
+  not by offset" in Step 11.
 
 Two rules:
 
@@ -380,18 +391,20 @@ voices; that is the whole point.
 
 ---
 
-## Step 5 — Transcribe twice, with two different model families
+## Step 5 — Transcribe three times, with three different model families
 
-**Run both passes. This is not optional.** Whisper supplies the timing and the
-primary wording; Canary is an architecturally independent second listener, and
-where the two agree a line needs no further thought. Together they cost about
-25 minutes for a 2-hour film on Metal, which is less than the old single CPU pass.
+**Run all three passes. This is not optional.** Whisper supplies the timing and
+the primary wording; Canary and Qwen3-ASR are architecturally independent second
+and third listeners. Where all three agree, a line needs no further thought.
+Together they cost about 45 minutes for a 2-hour film on Metal.
 
-There is an **optional third pass** (Step 5c), French audio only. It is a Whisper
-fine-tune, so it is *not* a third independent vote — it earns its place by
-transcribing speech the other two drop, not by breaking ties.
+The independence is the whole point, and it is why the list is these three and
+not any three. All three lineages are mutually unrelated — Whisper, NeMo
+FastConformer, and Qwen omni — so a shared error is unlikely rather than
+expected. Adding a *fourth* model that shares weights with one already in the
+list buys nothing; see "On running several models" in Step 8.
 
-Split the audio once, on silence, so no cut lands mid-word — both passes reuse it:
+Split the audio once, on silence, so no cut lands mid-word — all passes reuse it:
 
 ```bash
 python3 scripts/chunk_audio.py audio.wav work/chunks 600   # ~10-min targets
@@ -464,74 +477,52 @@ characteristic failure is decoder repetition inside a window
 (`Escorte. Escorte. Escorte.`) — repetition in `CAN` means "ignore this window",
 not "the dub repeats itself".
 
-### 5c. `large-v3-french`, the coverage pass (French audio, optional)
+### 5c. Qwen3-ASR-1.7B, the third independent pass
 
 ```bash
-bash scripts/setup_whisper_fr.sh          # one-time, ~10 min, builds the MLX model
+"$(uv tool dir)/mlx-audio/bin/python" scripts/run_qwen3.py \
+  audio.wav qwen3.srt fr
 ```
 
-```bash
-mlx_whisper audio.wav \
-  --model "$HOME/.cache/whisper-mlx/whisper-large-v3-french" --language fr \
-  --condition-on-previous-text False --hallucination-silence-threshold 2 \
-  --output-format srt --output-dir . --output-name french
-```
+Qwen3-ASR is a **third lineage** — neither Whisper nor NeMo — so its errors
+correlate with neither of the other two. That is the whole point: three mutually
+independent witnesses make "all three agree → stop thinking about this cue" a
+much stronger shortcut than two.
 
-(`--output-name` takes the stem, not the filename — it appends `.srt` itself.)
+`run_qwen3.py` handles the two things it gets wrong on its own, and its docstring
+explains both:
 
-`bofenghuang/whisper-large-v3-french` is a full fine-tune of `large-v3` (32
-layers, `n_vocab` 51866 — not a distil variant). Same runtime, same flags, same
-~17 min for a 2-hour film as Step 5a. Run it on the **whole** `audio.wav`, not the
-chunks: its output never reaches the alignment stage, so per-chunk SRTs buy
-nothing here, and the anti-loop flags are still mandatory — it loops worse than
-`large-v3`, not better.
+- **No segmentation.** `generate` returns one segment per call with
+  `start=0.0, end=<clip length>` — no internal timestamps, exactly like Canary.
+  The script windows the audio and reconstructs each timecode from its index.
+- **`max_tokens` defaults to 8192, which is a live footgun.** A 30 s window holds
+  ~100 tokens of speech; when the decoder loops it generates all 8192 and a
+  single window takes *minutes*. Measured: one window burned 5 minutes before
+  being capped. `max_tokens=220` plus a repetition penalty is what the script
+  sets, and it removed **every** loop from an 81-minute film.
 
-**Read this before deciding to run it.** Measured head-to-head against Step 5a on
-the same French film (*Intouchables*, 1 h 52 m, identical audio and flags):
+Measured on that film (81 min French, same audio as Steps 5a/5b):
 
-| | `large-v3` | `large-v3-french` |
-|---|---|---|
-| Words transcribed | 10 225 | **10 635** |
-| Speech duration covered | 74.2 min | **83.3 min** |
-| Empty `...` filler cues | 83 | **0** |
-| `Abonnez vous` hallucinations | 5 | **1** |
-| Cues stuck in a repetition loop | **5** | 16 |
-| Worst loop | 7× | **112×** (`Ah ! Ah ! Ah !…`) |
-| Cues over 20 s | **35** | 69 |
-| Cues total | 1890 | 964 |
+| | Whisper `large-v3` | Canary-1B-v2 | **Qwen3-ASR-1.7B** |
+|---|---|---|---|
+| Looping windows/cues | 3 regions | 3 windows | **0** |
+| Boilerplate hallucinations | 8 | 0 | 2 |
+| Words | 6 945 | ~6 700 | 6 714 |
+| Agreement with final file | — | — | **96%** (40 of 923 cues differed) |
 
-Only 39% of aligned blocks came back identical, so it disagrees with Step 5a
-constantly — 2 761 words changed across the 424 differing blocks.
+It is the **best-behaved** of the three, and 96% agreement with an already-corrected
+file is meaningful corroboration rather than noise. Its disagreements resolved
+three items that Whisper, Canary and the reference had all left unresolved —
+including one, `Dessous sa peau de lys`, where Qwen3 and the human subtitle
+independently converged on the same reading against the draft.
 
-**What it is good for.** It recovers whole exchanges that `large-v3` threw away as
-`...` filler — the single largest win, and exactly the class of miss Pass B is
-expensive to catch by hand:
+**`qwen3.srt` is a wording source, not a timing source.** Cue bounds are window
+bounds. Pass it to Pass B as `QWN`.
 
-| Time | `large-v3` | `large-v3-french` |
-|---|---|---|
-| 00:06:59 | `... ...` Ça va aller ? | On l'a prévenu, y a un brancard qui arrive dans une 2nde. On vous laisse là, ça va aller ? |
-| 01:17:45 | Ah d'accord. D'accord, y'a pas de soucis. `...` | Allô, Dries. Qu'est-ce que vous faites ? Je vous dérange ? … Vous voulez vous barrer, c'est ça ? |
-
-It is also better on French mechanics: `faut qu'on voie` not `faut qu'on voit`,
-`s'il n'est pas` not `s'il est pas`, `6 mois` not `Six mois`, `kilomètres` not `km`.
-
-**What disqualifies it as a primary pass.** It loops far harder than `large-v3`
-*with the identical anti-loop flags* — 112 consecutive `Ah !` swallowed a real
-exchange about phantom pain at 00:42:09, and at 01:23:38 an entire scene came back
-as the single cue `Sous-titrage MFP.` It also emits half as many cues covering
-*more* speech, so 69 cues run over 20 s — the same mega-cue failure that got
-Parakeet rejected above.
-
-So: **`french.srt` is a wording and coverage source, never a timing source, and
-never an independence vote.** It shares `large-v3`'s weights, so when it agrees
-with Step 5a that agreement is worth much less than Canary agreeing — see the
-independence rule under "On running several models". Pass it to Pass B as `FRW`,
-and treat a `FRW`-only line the way you treat any single-source claim: as a lead
-to verify, not a correction to apply.
-
-**Skip it** when the audio is not French — there is no equivalent fine-tune wired
-up for other languages, and pointing this step at non-French audio just gives you
-`large-v3` with extra steps.
+~12 min for an 81-minute film at 30 s windows. Weights are ~3.5 GB at bf16, so it
+fits comfortably on an 8 GB machine; `mlx-community/Qwen3-ASR-1.7B-8bit` halves
+that if needed. Qwen3-ASR covers 52 languages and dialects, so unlike a
+language-specific fine-tune this step is not French-only.
 
 ---
 
@@ -620,7 +611,9 @@ grep -vE '^[0-9]+$|-->' final.srt | grep -nE "[a-zà-ÿ] [A-ZÀ-Ý][a-zà-ÿ]"
 ```
 
 Filter out proper nouns and noun phrases ("la Dame Marieuse", "du général Li")
-before treating a hit as a real sentence start.
+before treating a hit as a real sentence start. Do not try to finish this here —
+correcting the wording in Step 8 creates new run-ons, so the systematic sweep
+belongs in **Step 9**, after the text has stopped changing.
 
 ---
 
@@ -659,15 +652,14 @@ comfortably in context:
 
 ```bash
 python3 scripts/review_pairs.py draft.srt 1 150 \
-  CAN=canary.srt FRW=french.srt REF=reference.srt WEB=web.srt
+  CAN=canary.srt QWN=qwen3.srt REF=reference.srt WEB=web.srt
 python3 scripts/review_pairs.py draft.srt 151 300 \
-  CAN=canary.srt FRW=french.srt REF=reference.srt WEB=web.srt
+  CAN=canary.srt QWN=qwen3.srt REF=reference.srt WEB=web.srt
 # ... continue to the end; each run prints the next batch's command
 ```
 
 Every source you obtained must be passed. Omit `REF` if the film had no in-file
-track, `WEB` if the search genuinely failed, or `FRW` if you skipped Step 5c, but
-never omit `CAN`.
+track or `WEB` if the search genuinely failed, but never omit `CAN` or `QWN`.
 
 **How to weigh the voices.** Each answers a different question, and confusing them
 is how false corrections get made:
@@ -676,41 +668,37 @@ is how false corrections get made:
 |---|---|---|
 | `ASR` (Whisper) | **Timing**, and the wording being judged | — |
 | `CAN` (Canary) | What was **said** — an independent listen | Timing (30 s windows) |
-| `FRW` (large-v3-french) | **Speech the others missed**; French mechanics | Timing (mega-cues); independence |
+| `QWN` (Qwen3-ASR) | What was **said** — a second independent listen | Timing (window bounds) |
 | `REF` (in-file subtitle) | **Whether** a line is wrong; meaning | Exact wording |
 | `WEB` (online subtitle) | **Proper-noun spellings**; scene meaning | Any wording choice; timing |
 
 `REF` and `WEB` are **not** independent of each other — both are typically
 translations of the same English script — so their agreement is weak evidence
-about the dub. Neither is `FRW` independent of `ASR`: it is a fine-tune of the
-same weights, so `ASR`+`FRW` agreement is close to one witness speaking twice.
-Only `ASR` and `CAN` are genuine independent witnesses to the audio.
-
-**Where `FRW` changes the procedure:** it does not get a vote in steps 1–3 below.
-Use it in one place only — when `ASR` shows `...`, a suspiciously short line, or
-nothing at a timecode where the film clearly has dialogue, check `FRW` for the
-words. That is the case it measurably wins (+9 minutes of recovered speech). When
-`FRW` supplies a line no other source has, verify it against `REF`/`WEB` for
-meaning before accepting: it is also the source most prone to inventing a
-112-times repetition or a `Sous-titrage MFP.` where a whole scene should be.
+about the dub. `ASR`, `CAN` and `QWN` *are* mutually independent witnesses to the
+audio, and that is what their agreement is worth.
 
 Read them as a decision procedure, in this order:
 
-1. **`ASR` and `CAN` agree** → the line is almost certainly right. Two independent
+1. **All three ASRs agree** → the line is almost certainly right. Three unrelated
    architectures rarely share an error. Move on, even if `REF` words it differently
-   — that is just translation divergence. This is what makes the two-model cost
-   worth it: it lets you *stop thinking* about most cues.
-2. **`ASR` and `CAN` differ** → the audio is genuinely ambiguous here, and this is
-   the highest-yield signal in the whole pipeline. Now use `REF` and `WEB` for the
-   meaning of the scene, plus the Step 1 synopsis and glossary, and pick the
-   reading that fits. Prefer whichever ASR is consistent with the established
-   context; Canary was measurably the better French transcriber, so on a pure
-   coin-flip it wins — but only after the meaning check, never before.
-3. **Both ASR passes agree but the line is nonsense** in context → the audio
-   misled both. Only `REF`/`WEB`/synopsis can save it, and often nothing can: send
-   it to the user-review table rather than inventing a fix.
-4. **A proper noun is involved** → `WEB`/`REF` decide the spelling, always,
-   regardless of what the two ASR passes heard.
+   — that is just translation divergence. This is what makes the three-model cost
+   worth it: it lets you *stop thinking* about most cues. On the reference run the
+   ASRs agreed on ~96% of cues, so this is the common case, not the rare one.
+2. **Two agree, one differs** → usually the majority is right, but check the odd
+   one out rather than dismissing it: a single model reading coherent French where
+   the other two produced nonsense is the pattern that produced several real fixes.
+   Confirm the meaning against `REF`/`WEB` before taking the minority reading.
+3. **All three differ** → the audio is genuinely ambiguous, and this is the
+   highest-yield signal in the pipeline. Use `REF` and `WEB` for the meaning of the
+   scene, plus the Step 1 synopsis and glossary, and pick the reading that fits.
+4. **All three agree but the line is nonsense** in context → the audio misled all
+   of them. Only `REF`/`WEB`/synopsis can save it, and often nothing can: send it to
+   the user-review table rather than inventing a fix.
+5. **A proper noun is involved** → `WEB`/`REF` decide the spelling, always,
+   regardless of what the ASR passes heard.
+
+**The strongest evidence available** is an independent ASR and the human subtitle
+converging on the same reading against your draft. When that happens, apply it.
 
 Then, for each cue, ask:
 
@@ -844,25 +832,30 @@ adds nothing:
   Measured against Parakeet TDT v3 on the same French film, Canary read
   `Ça y est, les voilà` and `100 euros que je les mets dans le vent` where Parakeet
   read `Dégage toi les voilà` and `100 euros que les mettre dans le nom`.
-- **A same-family fine-tune buys coverage, not independence.**
-  `bofenghuang/whisper-large-v3-french` (Step 5c) is a `large-v3` fine-tune, so the
-  rule above applies in full: its agreement with Step 5a is nearly worthless as
-  corroboration. What it does buy, measured on the same French film, is **+410
-  words and +9 minutes of speech** that `large-v3` emitted as `...` filler, plus
-  correct French mechanics (`faut qu'on voie`, `6 mois`, `kilomètres`). It pays for
-  itself as a *coverage* source and must never be scored as a third vote. Its cost
-  is real: 16 looping cues against `large-v3`'s 5, one of them 112× `Ah !`, and 69
-  cues over 20 s. Third pass, optional, French only.
+- **Qwen3-ASR-1.7B satisfies both as well**, and is a third lineage again, so it
+  is independent of Canary too. Measured the best-behaved of the three: zero
+  repetition loops on an 81-minute film where Whisper had three and Canary three,
+  and 96% agreement with an already-corrected file. Step 5c.
+- **`bofenghuang/whisper-large-v3-french` — do not use it.** It is a `large-v3`
+  fine-tune, so the two-Whisper-variants rule applies in full: its agreement with
+  Step 5a is nearly worthless as corroboration, and it cannot be scored as a vote.
+  It is also a *worse model* — measured on an 81-minute French film, 28 consecutive
+  `Je ne sais pas.`, 29 cues over 20 s, and 7 subtitling-house hallucinations, with
+  its loops sitting directly on top of real dialogue. It does yield corrections by
+  *disagreeing*, but Canary and Qwen3-ASR yield those too while also being
+  independent, so it earns no slot. French-only besides.
 - **Do not run them concurrently on CPU.** CTranslate2 already saturates the
   cores; parallel runs are proportionally slower each with no wall-clock gain.
-  On Metal this no longer applies, but run them sequentially anyway — each pass
-  wants the whole GPU.
+  On Metal this no longer applies, but run the ASR passes sequentially anyway —
+  each wants the whole GPU. A forced-alignment pass *can* overlap an ASR pass,
+  since it is a different stage on different weights.
 
-An honest caveat on the evidence: Canary was compared head-to-head against
-Parakeet, and against Whisper only on sample lines, not by WER against a human
-reference. Its *independence* from Whisper is architectural fact; its *superiority*
-to Whisper on French is not established. That is why Step 5a stays the timing and
-primary-wording source and Canary is the second opinion, rather than the reverse.
+An honest caveat on the evidence: these models were compared against each other
+and against a human reference subtitle, not by WER against a verified ground
+truth. Their mutual *independence* is architectural fact; a strict accuracy
+ranking between them is not established. That is why Step 5a stays the timing and
+primary-wording source and the other two are second opinions, rather than the
+reverse.
 
 Spend the effort on Step 1 (synopsis) and Pass B (line-by-line) first. Both
 were measured to catch far more, for far less compute.
@@ -876,7 +869,109 @@ and it is the only thing that separates a real check from a plausible-looking
 list. It cost one command here and prevented shipping a 234-cue list of noise
 as though it were diligence.
 
-### The endgame is the user, and that is by design
+---
+
+## Step 9 — Repair sentence boundaries
+
+**Do this after the wording is settled and before you hand anything to the user.**
+It has to come after Step 8 because every correction you apply can create a new
+run-on, and before the user-review table because a reader who trips over
+`...le canot Mais que faisais-tu` will report it as a *wording* error and waste a
+round of questions on a punctuation bug.
+
+The failure looks like this: a new sentence starts mid-line with no punctuation
+and no break.
+
+```
+Aide-moi à retourner le canot Mais que faisais-tu là-haut ?
+On doit pouvoir l'expliquer mais j'ignore comment Tu devrais demander à ton père
+Car il a attaqué avec la force brute de l'ours Il a prouvé qu'il était un brave
+```
+
+It is created by the pipeline, not by the ASR. Whisper emits a segment with
+sentence-final punctuation; `align_words.py` keeps only the words, and
+`build_srt.py` regroups them by acoustic onset, so a boundary that used to be a
+full stop becomes an ordinary inter-word gap. `build_srt.py` weights breaks
+toward these points but cannot fix a cue that is already two full lines.
+
+### Detect
+
+```bash
+python3 scripts/fix_sentence_breaks.py final.srt fr --report \
+  --glossary "John,Smith,Pocahontas,…" --words work/words.json
+```
+
+**A naive `grep` for `[a-zà-ÿ] [A-Z]` is useless here** — it fires on every proper
+noun (`c'est John Smith`, `la Dame Marieuse`, `du général Li`) and buries the real
+cases. On the reference run the naive pattern reported 145 hits of which only 68
+were genuine. Always pass the Step 1 glossary so names are excluded, and never
+quote a raw count you have not filtered.
+
+### Repair, in this order of preference
+
+1. **Split into two cues — the best fix, and it is usually available.** You have
+   word-level timings from Step 6, so look up the gap between the last word of
+   sentence A and the first of sentence B. If the gap is ≥ ~0.35 s there is a real
+   pause in the audio: split the cue there and give each half its own timecode.
+   This is strictly better than punctuation because it also fixes reading speed.
+2. **Insert a line break** when the gap is too small to split but both halves fit
+   two lines. Costs nothing and reads correctly.
+3. **Insert punctuation** — a full stop, or a comma where the two clauses really
+   are one sentence — when neither of the above fits.
+
+**Songs are the exception: do not add full stops.** Sung lyrics conventionally
+capitalise each line and carry no terminal punctuation, so
+`Au détour de la rivière Il sera là` is two *lyric lines*, not a missing period.
+Fix those with a line break (remedy 2) and leave the punctuation alone. Roughly
+half the genuine hits on the reference run were of this kind.
+
+Full run, once the wording is settled:
+
+```bash
+python3 scripts/fix_sentence_breaks.py final.srt fr --out fixed.srt \
+  --glossary "John,Smith,Pocahontas,…" --words work/words.json \
+  --song-ranges "00:10-00:40,11:55-15:10,25:48-28:50,…"
+```
+
+Give `--song-ranges` the sung passages — the Step 1 synopsis names the songs and
+the Step 11 coverage gaps give their timecodes. Inside those windows the script
+only breaks lines; everywhere else it restores the full stop. Reference run:
+921 → 969 cues, 48 split, 11 line-broken, 2 punctuated, word count unchanged.
+
+### Two traps that cost real time here
+
+**A repair pass that re-flows text will oscillate forever.** Fix boundary A by
+flattening the cue to re-wrap it and you erase the newline at boundary B, which
+reappears as a defect on the next pass — which you fix by flattening, erasing A
+again. The symptom is a residual count stuck at a small non-zero number pass after
+pass while the tool cheerfully reports work done. The cure is to treat **existing
+newlines as boundaries too** and cut the cue into *all* its sentence pieces in one
+go, never one at a time. That single change took convergence from never to one pass.
+
+**A capital is not always `{CAP}{LOW}+`.** Elided forms — `C'est`, `J'ai`, `L'or`,
+`Qu'il` — do not match that pattern, so a detector built on it reports a clean zero
+while `…plus fort C'est un vrai trésor` sits in the output. Allow an apostrophe
+inside the token.
+
+And the third, which the `NON_FINAL` list in the script exists for: a determiner or
+preposition can never end a sentence. Without that guard the repair invents
+`où est le. Capitaine Smith` and `Plus tard, ma fille. Le. Conseil doit se réunir`.
+
+### Verify
+
+Re-run the detector until it reports zero, then confirm the repair changed nothing
+it should not have:
+
+- **Splits add cues; punctuation and breaks must not.** `apply_fixes.py` cannot
+  split a cue — it only rewrites text — so do splits with a separate pass and
+  assert afterwards that every *original* timestamp still exists and that any new
+  one lies inside the cue it was split from.
+- Re-run the Step 7 line-length and 2-line checks. Adding a break can push a cue
+  to three lines, which `qa_srt.py` will catch but only if you re-run it.
+
+---
+
+## Step 10 — Hand the remainder to the user
 
 Once the sources are exhausted, what remains are the lines where the dub says
 something no other text records — and on the reference run **every correction
@@ -935,7 +1030,7 @@ that finds nothing.
 
 ---
 
-## Step 9 — QA
+## Step 11 — QA
 
 ```bash
 python3 scripts/qa_srt.py final.srt reference.srt
@@ -1003,7 +1098,7 @@ done
 
 ---
 
-## Step 10 — Deliver
+## Step 12 — Deliver
 
 Name the file to match the video so players auto-load it:
 
@@ -1230,7 +1325,7 @@ default) and enable VAD. Always check for repeated lines:
 **AC3 5.1 audio casts as silence.** The file plays perfectly on the desktop, so
 it reads as a device fault rather than a file fault, and ffmpeg emits no warning.
 Android TV and Chromecast simply drop the track: picture, no sound. Deliver
-AAC-LC stereo (Step 10). When a user reports missing audio on a TV, probe the
+AAC-LC stereo (Step 12). When a user reports missing audio on a TV, probe the
 codec *before* investigating anything else — and fix it by stream-copying the
 video, not by re-encoding it.
 
@@ -1322,9 +1417,10 @@ All under `scripts/`, all take explicit arguments, none hardcode paths.
 | `align_words.py` | Alignment-only pass for word-level timings |
 | `build_srt.py` | Rebuild cues with real subtitle constraints |
 | `find_suspects.py` | Dictionary check to surface candidate errors |
-| `review_pairs.py` | Draft vs every source (`CAN`/`FRW`/`REF`/`EN`) for line-by-line review |
+| `review_pairs.py` | Draft vs every source (`CAN`/`QWN`/`REF`/`WEB`) for line-by-line review |
 | `run_canary.py` | Independent second transcript from Canary-1B-v2 on Metal |
-| `setup_whisper_fr.sh` | One-time build of the `large-v3-french` MLX model (Step 5c) |
+| `run_qwen3.py` | Independent third transcript from Qwen3-ASR-1.7B on Metal |
+| `fix_sentence_breaks.py` | Step 9: find and repair unpunctuated sentence starts |
 | `adjudicate.py` | Show reference text at a suspect's timecode |
 | `apply_fixes.py` | Apply text fixes; asserts timings unchanged |
 | `qa_srt.py` | Structural, readability and coverage QA |
@@ -1338,6 +1434,7 @@ a mismatch fails quietly rather than loudly. Change all of these together:
 |---|---|---|---|
 | `mlx_whisper --language` | `fr` | `en` | ISO-639-1 |
 | `run_canary.py` 4th arg | `fr` | `en` | sets `source_lang` **and** `target_lang` |
+| `run_qwen3.py` 3rd arg | `fr` | `en` | ISO-639-1; Qwen3-ASR covers 52 languages |
 | `tesseract -l` (OCR) | `fra` | `eng` | ISO-639-2; needs `tesseract-lang` |
 | `hunspell -d` | `fr` | `en_US` | dictionary must be installed |
 | `align_words.py` | `fr` | `en` | picks the wav2vec2 alignment model |
@@ -1360,20 +1457,19 @@ language-neutral.
 ```bash
 brew install ffmpeg tesseract tesseract-lang hunspell
 uv tool install mlx-whisper     # Step 5a, Metal
-uv tool install mlx-audio       # Step 5b, Canary-1B-v2
-bash scripts/setup_whisper_fr.sh  # Step 5c, optional, French only (~10 min, 3 GB)
+uv tool install mlx-audio       # Steps 5b and 5c, Canary-1B-v2 and Qwen3-ASR
 # CPU fallback only, if MLX/Metal is unavailable:
 uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install whisperx
 ```
 
-`mlx-audio` installs its own interpreter; call `run_canary.py` with it rather than
-the project venv: `"$(uv tool dir)/mlx-audio/bin/python" scripts/run_canary.py ...`.
-Both MLX packages need Apple Silicon. Each model downloads ~2–3 GB on first use.
-`setup_whisper_fr.sh` is only needed for Step 5c; it builds into
-`~/.cache/whisper-mlx/` once and is a no-op on re-run. There is no published MLX
-build of that model, so the script converts it — and works around a HuggingFace
-Xet transfer that stalls on this repo and a weights-filename mismatch. Read its
-header before changing how it downloads.
+`mlx-audio` installs its own interpreter and serves **both** Steps 5b and 5c; call
+those scripts with it rather than the project venv:
+`"$(uv tool dir)/mlx-audio/bin/python" scripts/run_canary.py ...`.
+Both MLX packages need Apple Silicon. Each model downloads ~2–4 GB on first use.
+
+`mlx_whisper` may not land on `PATH` even when `uv tool install` reports success —
+if `command not found`, call it at `"$(uv tool dir)/mlx-whisper/bin/mlx_whisper"`.
+
 `align_words.py` (Step 6) still needs the whisperx venv — it uses wav2vec2, not MLX.
 
 **`brew install ffmpeg` is not enough for hard burn.** The core formula no longer
