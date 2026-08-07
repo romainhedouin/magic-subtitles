@@ -189,7 +189,7 @@ assumption afterwards costs both of you the run.
 
 ## Step 1 — Gather context about the film
 
-**This step is vital. Do not skip it, and do it before transcribing.** Nearly
+**This is an important step — do it before transcribing.** Nearly
 every correction in Step 8 depends on knowing what the film is about. Without
 it you will catch only the errors a dictionary flags, which is a small minority
 of them.
@@ -268,7 +268,7 @@ cares about song lyrics, and then only on those passages.
 
 ## Step 4 — Get the reference sources
 
-This is the step that makes the result reliable. **Do not skip it.**
+This is an important step: it's what makes the result reliable.
 
 Gather up to three text sources before transcribing. They do different jobs and
 are **not** interchangeable — this table is the one to keep in mind for the rest
@@ -309,10 +309,10 @@ against the source bitmap before "fixing" them** — see Pitfalls.
 
 ### 4b. Optional: a supplementary reference found online
 
-**Required, unless the user supplied one — always search.** Do not treat this as
-optional and do not skip it because 4a succeeded. A second reference resolves
-cases where the first is too divergent to judge, which is the single biggest
-cause of errors that survive to the end. Save it as `web.srt`.
+Worth searching for even when 4a already succeeded, unless the user supplied
+one directly: a second reference resolves cases where the first is too
+divergent to judge, which is the single biggest cause of errors that survive
+to the end. Save it as `web.srt`.
 
 Search by exact release name first, then by title and year
 (`"Intouchables 2011 sous-titres français srt"`). Check the release folder and
@@ -423,7 +423,7 @@ mlx_whisper work/chunks/000.wav \
   --output-format srt --output-dir work/srt --output-name 000
 ```
 
-**The two flags are mandatory, not tuning.** `mlx-whisper` has no VAD, so with
+**These two flags matter — they're not just tuning.** `mlx-whisper` has no VAD, so with
 default settings it falls into repetition loops that WhisperX's VAD would have
 prevented. Measured on a 10-minute French clip:
 
@@ -644,22 +644,90 @@ python3 scripts/find_suspects.py draft.srt fr --foreign en
 python3 scripts/adjudicate.py draft.srt reference.srt fr WORD1 WORD2 ...
 ```
 
-### Pass B — contextual line-by-line read against all sources (mandatory)
+### Pass B — contextual line-by-line read against all sources (important)
 
-Read **every cue** against **every source** at the same timecode. Do not skip this
-and do not sample it. Work in batches of 100–150 cues so each batch fits
-comfortably in context:
+Pass A catches only errors that spell as non-words; most real ASR errors are
+valid words in the wrong place, and this pass is what catches those. It's worth
+doing thoroughly.
 
-```bash
-python3 scripts/review_pairs.py draft.srt 1 150 \
-  CAN=canary.srt QWN=qwen3.srt REF=reference.srt WEB=web.srt
-python3 scripts/review_pairs.py draft.srt 151 300 \
-  CAN=canary.srt QWN=qwen3.srt REF=reference.srt WEB=web.srt
-# ... continue to the end; each run prints the next batch's command
+**Run this pass as a single `Workflow` call, rather than manual subagent calls
+or inline analysis.** A `Workflow` script computes the batch list from the
+*actual* cue count in `draft.srt`, in code — so coverage of the full file
+follows automatically from the loop bound, without needing to track it by hand
+across batches. It's also the cheapest option for the main thread: one
+`Workflow` call replaces a whole batch's worth of separate round-trips, and
+only the workflow's final aggregated JSON — not any subagent's scratch work —
+lands back in the main conversation.
+
+```js
+export const meta = {
+  name: 'pass-b-review',
+  description: 'Pass B: three-source line-by-line review of every cue',
+  phases: [{ title: 'Review batches' }],
+}
+const TOTAL_CUES = args.totalCues        // from: grep -c '\-\->' draft.srt -- a
+                                          // real count, never an estimate
+const BATCH = 150
+const batches = []
+for (let lo = 1; lo <= TOTAL_CUES; lo += BATCH) {
+  batches.push([lo, Math.min(lo + BATCH - 1, TOTAL_CUES)])
+}
+log(`Pass B: ${batches.length} batches covering cues 1-${TOTAL_CUES}`)
+
+const FINDINGS_SCHEMA = { type: 'object', properties: { findings: { type: 'array',
+  items: { type: 'object', properties: {
+    cue: { type: 'integer' }, timestamp: { type: 'string' },
+    verdict: { enum: ['fix', 'ask', 'dismiss'] },
+    fix_text: { type: 'string' }, justification: { type: 'string' },
+  }, required: ['cue', 'timestamp', 'verdict'] } } } }
+
+const results = await pipeline(batches, ([lo, hi]) =>
+  agent(
+    `Run review_pairs.py on draft.srt for cues ${lo}-${hi} against ` +
+    `CAN=canary.srt QWN=qwen3.srt REF=reference.srt WEB=web.srt (omit ` +
+    `whichever of REF/WEB weren't obtained). Read every one of these cues ` +
+    `against every source -- do not sample. Apply the authority table and ` +
+    `numbered decision procedure from the magic-subtitles skill's Pass B ` +
+    `section [paste that content here]. Return one entry per flagged cue, ` +
+    `not the raw comparisons.`,
+    { schema: FINDINGS_SCHEMA, label: `cues ${lo}-${hi}` }))
+
+const findings = results.filter(Boolean).flatMap(r => r.findings)
+return { batchesRun: batches, cuesCovered: TOTAL_CUES, findings }
 ```
 
-Every source you obtained must be passed. Omit `REF` if the film had no in-file
-track or `WEB` if the search genuinely failed, but never omit `CAN` or `QWN`.
+Pass `totalCues` in as `args` from the real count. When the workflow returns,
+`batchesRun` covers what was actually reviewed — check it against
+`[1, TOTAL_CUES]` before moving on.
+
+For a typical 90–120 min film this is 8–12 batches — comfortably inside the
+default workflow-size guideline (keep it under ~15 agents) without needing to
+ask the user for a larger budget.
+
+Every source obtained must be passed to every batch. Omit `REF` if the film had
+no in-file track or `WEB` if the search genuinely failed, but never omit `CAN`
+or `QWN`.
+
+Where a batch surfaces a severe multi-model-disagreement region — a decoder
+loop, a hallucination all sources contradict — have it return a recommended
+structural action (drop / reconstruct-from-corroborating-sources) with the cue
+range, not just a text substitution; those cases need more than `fixes.json`
+can express. Aggregate every batch's findings before building `fixes.json` so a
+cross-cue consistency call (a proper-noun spelling used throughout the film)
+gets made once, centrally, not redecided per batch.
+
+**The tradeoff, plainly:** the raw quoted evidence behind a given call — the
+actual `CAN[...]:` / `REF:` excerpts a subagent weighed — lives only in that
+subagent's own transcript, not in the main conversation. Auditing a specific fix
+later means fetching that transcript (the workflow's journal, or the run's
+transcript directory) rather than scrolling up here. That's an accepted cost for
+keeping the main thread's token usage from compounding over a multi-hour run; it
+does not change how rigorously any single cue gets evaluated, since the
+subagent still has to weigh the same sources to produce its verdict.
+
+**Everything below is the content to paste into each batch's subagent prompt**
+— the methodology itself doesn't change, only who executes it and what comes
+back to the main thread.
 
 `review_pairs.py` sequence-aligns each cue's words against the overlapping window
 of every independent ASR and marks any word none of them supports `[[like this]]`,
@@ -751,6 +819,9 @@ Typical catches that only this pass finds:
 Beware the inverse: `quelques-uns` is correct and must **not** be swept up by a
 blanket `uns → Huns` replacement. Always anchor replacements to enough
 surrounding words to be unambiguous.
+
+Before moving on, check the `Workflow` call's `batchesRun` against
+`[1, TOTAL_CUES]`.
 
 ### Pass C — hallucination sweep
 
@@ -1122,6 +1193,15 @@ substantive line out of dozens; the rest were genuinely masked. Try it once,
 report what it found, and put the remainder in the user-review table rather than
 grinding.
 
+If there are more than a handful of gaps to investigate, delegate the sweep to a
+subagent for the same reason as Pass B: each gap needs a timestamp lookup across
+`REF`/`CAN`/`QWN`, sometimes a re-extraction and re-transcription, and printing
+all of that inline compounds token cost across the rest of the run for little
+benefit. Hand the subagent the gap list with timestamps, `reference.srt`,
+`canary.srt`, `qwen3.srt`, and the movie's audio path; ask it to attempt the
+recovery and return only the recovered lines (with timestamps) plus a one-line
+note on what remained genuinely masked.
+
 Also resist the tempting diagnosis. "Crowd lines are missing because we took the
 centre channel and crowds are mixed into the surrounds" is plausible, cheap to
 test, and was **measured false** — the centre channel was equally loud or louder
@@ -1133,6 +1213,23 @@ for t in <timestamps>; do
     -af "pan=mono|c0=c2,volumedetect" -f null - 2>&1 | grep mean_volume
 done
 ```
+
+### Pre-delivery checklist
+
+Before Step 12, check each of these against an artifact — a file that exists,
+a command's actual printed output:
+
+- [ ] **Step 5:** three independent transcripts exist and are non-empty —
+      `work/srt/*.srt` (or the CPU-fallback equivalent), `canary.srt`,
+      `qwen3.srt`.
+- [ ] **Step 6:** `work/words.json` exists; its duration distribution was
+      printed and any outliers were clamped.
+- [ ] **Step 8 Pass B:** the `Workflow` call's `batchesRun` covers
+      `[1, TOTAL_CUES]` with no gaps.
+- [ ] **Step 9:** `fix_sentence_breaks.py --report` was re-run after the final
+      wording pass and converged to 0 genuine hits.
+- [ ] **Step 11:** `qa_srt.py` reports PASS, and coverage gaps over a few
+      seconds were investigated.
 
 ---
 
