@@ -48,7 +48,12 @@ def load_srt(path):
     return cues
 
 
-def overlap_text(cues, t0, t1, pad=1.0):
+def overlap_text(cues, t0, t1, pad=10.0):
+    """10s default: wide enough to catch a full neighbouring Canary/Qwen3
+    window (they run ~8s by default) even when the flagged span sits near a
+    window boundary. A narrower pad reliably produces false "nothing here"
+    reads against short-windowed sources -- the content is one window over,
+    not missing."""
     return [(s, e, txt) for s, e, txt in cues if e >= t0 - pad and s <= t1 + pad]
 
 
