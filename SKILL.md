@@ -39,7 +39,7 @@ they are read against each other line by line.
 | Model | Job | Never used for |
 |---|---|---|
 | `whisper-large-v3-mlx` | Timing + primary wording | — |
-| `Canary-1B-v2` | Independent second listen | Timing (30 s windows) |
+| `Canary-1B-v2` | Independent second listen | Timing (silence-aligned windows) |
 | `Qwen3-ASR-1.7B` | Independent third listen | Timing (window bounds) |
 | `wav2vec2-large-xlsr-53-<lang>` | Word-level forced alignment | Wording — it cannot change a word |
 
@@ -90,6 +90,12 @@ extraction.
 | Canary-1B-v2 | `mlx-audio` (Metal) | **15×** | ~8 min | **No — all zeros** |
 | Qwen3-ASR-1.7B | `mlx-audio` (Metal) | ~7× | ~17 min | **No — one segment per call** |
 | Parakeet TDT 0.6B v3 | `parakeet-mlx` (Metal) | 33× | ~3.5 min | Yes, incl. word-level |
+
+The Canary/Qwen3 rows above predate silence-aligned windowing (Step 5b/5c now
+target ~8s windows instead of fixed 30s blocks — see there for why). Expect
+roughly 4x the model calls and a real but unmeasured slowdown; the per-call
+overhead is small next to a 30s decode, so this is unlikely to change which
+model is the bottleneck, but don't quote the 15×/~7× figures above as current.
 
 The 7.3× for `mlx-whisper` **depends on the anti-loop flags** in Step 5a. Without
 them it measures 5.2× *and* produces garbage — see there. `faster-whisper`/WhisperX
@@ -463,17 +469,31 @@ uv tool install mlx-audio
   audio.wav work canary.srt fr
 ```
 
-`run_canary.py` handles the three things Canary gets wrong on its own, and its
-docstring explains each: it splits the audio into 30 s windows (Canary does no
-chunking and silently truncates at `max_tokens=200`), reconstructs a timecode per
-window (mlx-audio returns `start=0.0, end=0.0` for everything), and always sets
+`run_canary.py` handles the four things Canary gets wrong on its own, and its
+docstring explains each: it splits the audio into short, silence-aligned windows
+(~8s by default — Canary does no chunking of its own and silently truncates at
+`max_tokens=200`), reconstructs each window's timecode from the actual cut
+points (mlx-audio returns `start=0.0, end=0.0` for everything), always sets
 `source_lang == target_lang` (otherwise you get a *translation*, and mlx-audio's
 CLI silently drops `--language`, so French audio comes back as fluent English with
-no warning). It checkpoints per window and resumes.
+no warning), and keeps windows short enough that one blob of prose rarely spans
+more than one exchange. It checkpoints per window and resumes.
 
-**`canary.srt` is a wording source, not a timing source.** Its cue boundaries are
-30-second window boundaries, so never let it near the timing stage. Its
-characteristic failure is decoder repetition inside a window
+**Why short windows, not the fixed 30s blocks from earlier versions of this
+script.** A 30-second blob covering several unrelated lines of dialogue under a
+single timecode is easy to skim past — you read one clause that supports
+whatever you're checking and don't notice the rest of the blob describes
+content your draft doesn't have at all. That's exactly how a decoder-loop
+artifact once got fixed as a single interjection while ~13 seconds of real
+dialogue sitting in the same Canary window went unnoticed (see Pitfalls).
+Shorter, silence-aligned windows don't eliminate the risk — a fast
+back-and-forth with no pause still gets bundled — but they cut it down a lot
+and make a window's content much easier to line up against your draft or
+`check_swallowed_spans.py` directly.
+
+**`canary.srt` is a wording source, not a timing source.** Its cue boundaries
+are still window boundaries, not speech boundaries, so never let it near the
+timing stage. Its characteristic failure is decoder repetition inside a window
 (`Escorte. Escorte. Escorte.`) — repetition in `CAN` means "ignore this window",
 not "the dub repeats itself".
 
@@ -494,12 +514,16 @@ explains both:
 
 - **No segmentation.** `generate` returns one segment per call with
   `start=0.0, end=<clip length>` — no internal timestamps, exactly like Canary.
-  The script windows the audio and reconstructs each timecode from its index.
-- **`max_tokens` defaults to 8192, which is a live footgun.** A 30 s window holds
-  ~100 tokens of speech; when the decoder loops it generates all 8192 and a
-  single window takes *minutes*. Measured: one window burned 5 minutes before
-  being capped. `max_tokens=220` plus a repetition penalty is what the script
-  sets, and it removed **every** loop from an 81-minute film.
+  The script windows the audio into short, silence-aligned chunks (~8s by
+  default, same reasoning as `run_canary.py` — a 30s blob of prose is easy to
+  skim past a coverage mismatch in) and reconstructs each timecode from the
+  actual cut points, not its index.
+- **`max_tokens` defaults to 8192, which is a live footgun.** Even a short window
+  holds well under 100 tokens of speech; when the decoder loops it generates
+  all 8192 and a single window takes *minutes*. Measured: one window burned 5
+  minutes before being capped. `max_tokens=220` plus a repetition penalty is
+  what the script sets, and it removed **every** loop from an 81-minute film
+  (back when both this and Canary used 30s windows).
 
 Measured on that film (81 min French, same audio as Steps 5a/5b):
 
@@ -519,7 +543,9 @@ independently converged on the same reading against the draft.
 **`qwen3.srt` is a wording source, not a timing source.** Cue bounds are window
 bounds. Pass it to Pass B as `QWN`.
 
-~12 min for an 81-minute film at 30 s windows. Weights are ~3.5 GB at bf16, so it
+~12 min for an 81-minute film was measured at 30 s windows; expect more now with
+~8s silence-aligned windows (roughly 4x the model calls — not re-measured).
+Weights are ~3.5 GB at bf16, so it
 fits comfortably on an 8 GB machine; `mlx-community/Qwen3-ASR-1.7B-8bit` halves
 that if needed. Qwen3-ASR covers 52 languages and dialects, so unlike a
 language-specific fine-tune this step is not French-only.
@@ -541,37 +567,44 @@ python3 scripts/align_words.py work/chunks work/srt work/words.json fr
 The aligner can only place words **inside the segment window whisper gave it**.
 Wherever whisper closed a segment early, the words get crammed, and wherever it
 left a long window around a short utterance, one word can absorb seconds of
-silence. Check the distribution before trusting it:
+silence — up to Whisper's own segment-length cap (30s), which is how much
+damage a single stuck decoder loop can do to one word's timing.
 
 ```bash
-python3 - <<'EOF'
-import json
-d = json.load(open('work/words.json'))
-durs = sorted(w['end'] - w['start'] for ws in d.values() for w in ws)
-n = len(durs)
-for q in (50, 90, 99, 99.9):
-    print(f'p{q}: {durs[int(n * q / 100)]:.2f}s')
-print('max:', round(durs[-1], 2), ' over 2s:', sum(1 for x in durs if x > 2))
-EOF
+python3 scripts/clamp_durations.py work/words.json work/chunks/cuts.txt \
+  work/words.json work/suspects.json
 ```
 
-A healthy French/English distribution sits around p50 ≈ 0.15 s and p99 ≈ 1 s. A
-maximum in the double digits means an outlier, and it does **two** kinds of
-damage — the obvious over-long cue, and a much less obvious one: because
-`build_srt.py` splits whenever the gap between consecutive words exceeds 0.8 s,
-an inflated word manufactures a fake gap and **tears its sentence into three
-cues**. Fixing the SRT afterwards would leave those bad splits in place.
+This clamps every implausible duration (keeping each word's start, since its
+onset is usually right and only the end is wrong) and, in the same pass, flags
+any word whose *original* duration exceeded 6 seconds to `work/suspects.json`.
+A healthy French/English distribution sits around p50 ≈ 0.15 s and p99 ≈ 1 s,
+so the print-out will tell you directly whether anything was flagged.
 
-Clamp at the word level instead, keeping each word's start (its onset is
-usually right; only the end is wrong):
+**A flagged word is not resolved by clamping it.** Clamping only fixes the
+*timing* damage — the obvious over-long cue, and the less obvious one where
+`build_srt.py` splits on any inter-word gap over 0.8s, so an inflated word
+manufactures a fake gap and tears its own sentence into three cues. It says
+nothing about whether the collapsed word was standing in for real dialogue. A
+word that was 27 seconds long before clamping was 27 seconds of *something* —
+there is no reason to assume that something was silence just because it later
+decoded as a repeated vowel. Before Pass C decides what a flagged word actually
+was (a scream, a hallucination, whatever), run:
 
-```python
-cap = min(4.5, max(1.2, 0.12 * len(word.strip())))   # generous for sung/held notes
-w['end'] = min(w['end'], w['start'] + cap)
+```bash
+python3 scripts/check_swallowed_spans.py work/suspects.json draft.srt \
+  CAN=canary.srt QWN=qwen3.srt REF=reference.srt WEB=web.srt
 ```
 
-In the reference run this touched 0.6% of words and simultaneously removed every
-cue over 6 s and rejoined the torn sentences.
+This prints, for each flagged span, what every source says happened there and
+how much text your own draft has in the same window. If an independent source
+shows several sentences where your draft has one short cue or none, that's the
+signature of swallowed dialogue, not a solved artifact — treat the whole span
+with the same targeted-re-transcription treatment as any other coverage gap
+(Step 11), not with a single replacement word.
+
+In a reference run, clamping touched 0.6% of words and simultaneously removed
+every cue over 6 s and rejoined the torn sentences.
 
 **Two things measured not to work** — don't spend time rediscovering them:
 
@@ -757,7 +790,7 @@ is how false corrections get made:
 | | Authority on | Explicitly NOT authority on |
 |---|---|---|
 | `ASR` (Whisper) | **Timing**, and the wording being judged | — |
-| `CAN` (Canary) | What was **said** — an independent listen | Timing (30 s windows) |
+| `CAN` (Canary) | What was **said** — an independent listen | Timing (silence-aligned windows) |
 | `QWN` (Qwen3-ASR) | What was **said** — a second independent listen | Timing (window bounds) |
 | `REF` (in-file subtitle) | **Whether** a line is wrong; meaning | Exact wording |
 | `WEB` (online subtitle) | **Proper-noun spellings**; scene meaning | Any wording choice; timing |
@@ -835,6 +868,11 @@ grep -vE '^[0-9]+$|-->|^$' draft.srt | sort | uniq -c | sort -rn | head
 
 Any subtitling-house credit, "thanks for watching", or line repeated many times
 is a hallucination. Drop it via `drop_matching` in the fixes file.
+
+**Check `work/suspects.json` before accepting any fix for a flagged word.** If
+Step 6 flagged words there, `check_swallowed_spans.py` should already have run;
+resolve what each span actually needs (a short interjection, a dropped loop, or
+a reconstructed passage) using its output before treating that cue as done.
 
 ### Applying
 
@@ -1188,10 +1226,16 @@ What remains is genuinely missed speech, and it is dominated by very short crowd
 shouts and interjections — the hardest thing for the ASR under music and noise.
 
 **A targeted re-transcription of gap windows is worth one attempt and rarely
-more.** In the reference run, re-running the largest gaps recovered exactly one
-substantive line out of dozens; the rest were genuinely masked. Try it once,
-report what it found, and put the remainder in the user-review table rather than
-grinding.
+more** for gaps in general — most recover nothing, since the underlying speech
+is genuinely masked. Try each once, report what it found, and put the rest in
+the user-review table rather than grinding.
+
+**Gaps that overlap a span from `work/suspects.json` are the exception —
+always investigate those**, regardless of how they rank by raw duration.
+`qa_srt.py` ranks gaps by size, which can bury a short but confirmed-suspect
+span under longer ones that turn out to be ordinary missed interjections. A
+span Step 6 already flagged and `check_swallowed_spans.py` already showed
+other sources disagreeing with is a known problem, not a candidate to rank.
 
 If there are more than a handful of gaps to investigate, delegate the sweep to a
 subagent for the same reason as Pass B: each gap needs a timestamp lookup across
@@ -1223,7 +1267,9 @@ a command's actual printed output:
       `work/srt/*.srt` (or the CPU-fallback equivalent), `canary.srt`,
       `qwen3.srt`.
 - [ ] **Step 6:** `work/words.json` exists; its duration distribution was
-      printed and any outliers were clamped.
+      printed and any outliers were clamped. If `work/suspects.json` is
+      non-empty, `check_swallowed_spans.py` was run on it and every span
+      resolved (not just clamped).
 - [ ] **Step 8 Pass B:** the `Workflow` call's `batchesRun` covers
       `[1, TOTAL_CUES]` with no gaps.
 - [ ] **Step 9:** `fix_sentence_breaks.py --report` was re-run after the final
@@ -1569,6 +1615,8 @@ All under `scripts/`, all take explicit arguments, none hardcode paths.
 | `chunk_audio.py` | Silence-aligned chunking; writes `cuts.txt` |
 | `run_chunks.sh` | Per-chunk WhisperX with resume-safe checkpointing |
 | `align_words.py` | Alignment-only pass for word-level timings |
+| `clamp_durations.py` | Clamp implausible word durations; flags spans that may hide swallowed dialogue |
+| `check_swallowed_spans.py` | Diff every source's content against your draft for a flagged span |
 | `build_srt.py` | Rebuild cues with real subtitle constraints |
 | `find_suspects.py` | Dictionary check to surface candidate errors |
 | `review_pairs.py` | Draft vs every source, word-level disagreement marking and tiering |
