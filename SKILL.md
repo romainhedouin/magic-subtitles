@@ -756,6 +756,19 @@ can express. Aggregate every batch's findings before building `fixes.json` so a
 cross-cue consistency call (a proper-noun spelling used throughout the film)
 gets made once, centrally, not redecided per batch.
 
+**A reconstruction has two parts, wording and timing, and corroborating
+sources answer both — never split a recovered gap evenly between two anchor
+timestamps.** Real speech isn't paced evenly, so dividing a 30-second gap into
+five equal slices because you're inserting five lines will drift every one of
+them against the actual audio, compounding line over line, until the next
+untouched real timestamp snaps it back — which reads as "the subtitles run
+increasingly late, then correct." Use whichever source actually has per-line
+timing for that span: `REF`/`WEB`'s own cue boundaries if they cover it, or
+`CAN`/`QWN`'s window boundaries if they don't (coarser, but real — grounded in
+where those models actually detected a boundary, not an arbitrary division).
+Only fall back to even spacing when *no* source has any timing at all for that
+span, and say so explicitly rather than presenting it as resolved.
+
 **The tradeoff, plainly:** the raw quoted evidence behind a given call — the
 actual `CAN[...]:` / `REF:` excerpts a subagent weighed — lives only in that
 subagent's own transcript, not in the main conversation. Auditing a specific fix
