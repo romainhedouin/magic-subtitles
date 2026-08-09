@@ -21,10 +21,12 @@ idiom broken, an insult heard as a proper noun.
 
 The core idea: **transcribe the audio three times with three unrelated model
 families, then correct the result against human subtitles in the same language.**
-Whisper `large-v3` (on Metal) supplies the timing and the primary wording;
-NVIDIA Canary-1B-v2 and Qwen3-ASR-1.7B are independent second and third
-listeners, so where they agree a line needs no further thought and where they
-differ you have found the exact places the audio is ambiguous. A fourth model,
+Whisper `large-v3` (on Metal) supplies the timing — its segment structure is
+what wav2vec2 aligns to word level, which neither other model can provide —
+and a first guess at the wording. NVIDIA Canary-1B-v2 and Qwen3-ASR-1.7B are
+independent listeners with equal standing on wording, not lesser ones: where
+all three agree a line needs no further thought, and where they differ you
+have found the exact places the audio is ambiguous. A fourth model,
 wav2vec2, never transcribes at all — it only forced-aligns the chosen words to
 recover per-word timings. The subtitle files — the track inside the movie file,
 plus one fetched online — are human translations timecoded to a real release;
@@ -38,9 +40,9 @@ they are read against each other line by line.
 
 | Model | Job | Never used for |
 |---|---|---|
-| `whisper-large-v3-mlx` | Timing + primary wording | — |
-| `Canary-1B-v2` | Independent second listen | Timing (silence-aligned windows) |
-| `Qwen3-ASR-1.7B` | Independent third listen | Timing (window bounds) |
+| `whisper-large-v3-mlx` | Timing + a first wording guess | — |
+| `Canary-1B-v2` | Independent listen, equal weight on wording | Timing (silence-aligned windows) |
+| `Qwen3-ASR-1.7B` | Independent listen, equal weight on wording | Timing (window bounds) |
 | `wav2vec2-large-xlsr-53-<lang>` | Word-level forced alignment | Wording — it cannot change a word |
 
 ---
@@ -402,10 +404,12 @@ voices; that is the whole point.
 
 ## Step 5 — Transcribe three times, with three different model families
 
-**Run all three passes. This is not optional.** Whisper supplies the timing and
-the primary wording; Canary and Qwen3-ASR are architecturally independent second
-and third listeners. Where all three agree, a line needs no further thought.
-Together they cost about 45 minutes for a 2-hour film on Metal.
+**Run all three passes. This is not optional.** Whisper supplies the timing —
+the only one of the three that can, since only its segment structure gives
+wav2vec2 something to align — and a first guess at the wording; Canary and
+Qwen3-ASR are architecturally independent listeners with an equal vote on that
+wording, not a lesser one. Where all three agree, a line needs no further
+thought. Together they cost about 45 minutes for a 2-hour film on Metal.
 
 The independence is the whole point, and it is why the list is these three and
 not any three. All three lineages are mutually unrelated — Whisper, NeMo
@@ -987,9 +991,15 @@ adds nothing:
 An honest caveat on the evidence: these models were compared against each other
 and against a human reference subtitle, not by WER against a verified ground
 truth. Their mutual *independence* is architectural fact; a strict accuracy
-ranking between them is not established. That is why Step 5a stays the timing and
-primary-wording source and the other two are second opinions, rather than the
-reverse.
+ranking between them is not established. **That cuts against treating Whisper's
+wording as the default, not for it** — with no evidence any one of the three is
+more accurate than the others, there is no basis for giving Whisper's guess the
+benefit of the doubt over Canary's or Qwen3's. Step 5a stays the *timing*
+source because it is the only one that can be (Section above); on *wording* all
+three are votes of equal weight, and a homophone slip that reads fluently is
+just as capable of surviving in Whisper's output unquestioned as in either of
+the others' — the discipline of actually checking is what catches it, not
+which model produced it.
 
 Spend the effort on Step 1 (synopsis) and Pass B (line-by-line) first. Both
 were measured to catch far more, for far less compute.
