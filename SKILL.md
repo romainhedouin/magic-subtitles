@@ -47,14 +47,17 @@ they are read against each other line by line.
 
 ## Step 0 — Interview the user
 
-Ask these three questions **before doing any work**. Use the AskUserQuestion
-tool, all three in a single call.
+Ask the remaining questions below **before doing any work**. Use the
+AskUserQuestion tool, all of them in a single call. **Do not ask which Whisper
+model to use** — always run `large-v3` on Metal, unconditionally. See the fixed
+decision below for why.
 
-### Q1. Which Whisper model?
+### Whisper model: always `large-v3` on Metal — not a question
 
-**Run `large-v3` on Metal via `mlx-whisper`, not on CPU via CTranslate2.** Same
-weights, same accuracy, measured **7× the speed** — this is the default now, and
-Q1 exists only to let the user pick a *smaller* model, not a different runtime.
+**Run `large-v3` on Metal via `mlx-whisper`, not on CPU via CTranslate2, and
+never offer `turbo`/`medium`/`small` as an alternative.** Same weights as CPU,
+same accuracy, measured **7× the speed** — Metal removed the old speed-vs-accuracy
+trade entirely, so there is no real choice left to hand the user here.
 Times below are for a ~90-minute film on an M4 Air; see the measured table after
 Q3 for the numbers behind this.
 
@@ -1227,8 +1230,29 @@ shouts and interjections — the hardest thing for the ASR under music and noise
 
 **A targeted re-transcription of gap windows is worth one attempt and rarely
 more** for gaps in general — most recover nothing, since the underlying speech
-is genuinely masked. Try each once, report what it found, and put the rest in
-the user-review table rather than grinding.
+is genuinely masked. Try each once.
+
+**A re-transcription attempt is a new single-source guess, not a result.** It
+carries no more authority than the original draft's guess at that span did —
+running Whisper again on an isolated clip is still one ASR, and one ASR with
+no cross-check is exactly the failure mode this whole pipeline exists to avoid.
+Put whatever text comes back through the same check as any other cue before it
+goes anywhere near the delivered file: read `canary.srt`, `qwen3.srt`,
+`reference.srt` and `web.srt` at that timestamp (`check_swallowed_spans.py`'s
+`overlap_text` pattern works for this even outside its `suspects.json` flow —
+diff the same window against all four). Apply Pass B's decision procedure to
+the recovered text like any other candidate wording:
+
+- another source corroborates it → accept it
+- sources disagree with each other and with it → it is not "found", it is one
+  more guess; put it in the user-review table with the other readings, don't
+  insert it
+- nothing else covers that span at all → say so plainly rather than shipping
+  an unconfirmed line as if it were resolved
+
+"I reported what the re-transcription produced" is not the same as "I checked
+whether anything else agrees with it" — only the second one means the gap is
+actually resolved.
 
 **Gaps that overlap a span from `work/suspects.json` are the exception —
 always investigate those**, regardless of how they rank by raw duration.
@@ -1243,8 +1267,10 @@ subagent for the same reason as Pass B: each gap needs a timestamp lookup across
 all of that inline compounds token cost across the rest of the run for little
 benefit. Hand the subagent the gap list with timestamps, `reference.srt`,
 `canary.srt`, `qwen3.srt`, and the movie's audio path; ask it to attempt the
-recovery and return only the recovered lines (with timestamps) plus a one-line
-note on what remained genuinely masked.
+recovery, cross-check whatever comes back against every other source the same
+way Pass B would, and return each recovered line tagged `corroborated` or
+`unconfirmed` — never a bare line with no indication of whether anything else
+agrees with it — plus a one-line note on what remained genuinely masked.
 
 Also resist the tempting diagnosis. "Crowd lines are missing because we took the
 centre channel and crowds are mixed into the surrounds" is plausible, cheap to
