@@ -873,9 +873,6 @@ Beware the inverse: `quelques-uns` is correct and must **not** be swept up by a
 blanket `uns → Huns` replacement. Always anchor replacements to enough
 surrounding words to be unambiguous.
 
-Before moving on, check the `Workflow` call's `batchesRun` against
-`[1, TOTAL_CUES]`.
-
 ### Pass C — hallucination sweep
 
 Whisper emits boilerplate from its training data, especially over silence and
@@ -1136,21 +1133,14 @@ after that point came from the user listening.** A question is cheaper than a
 wrong guess and cheaper than an hour of compute that finds nothing. Treat it as
 the design of the process, not an admission of failure.
 
-**Write findings down as you read them, not afterwards.** Use
-`scripts/findings.py`: every flagged cue gets one appended line the moment you
-judge it, with a verdict of `fix`, `ask` or `dismiss`. The user table and the
-fixes file are then *generated* from that ledger, and `findings.py check`
-enforces the accounting identity
-
-    flagged == fix + ask + dismiss
-
-refusing to balance if any flagged cue was never dispositioned. This is not
-bureaucracy. On the reference run a cue was correctly identified as wrong during
-Pass B — the reference disagreed, the note "probably `leur en causera`" was
-made — and then never reached the user table, because it lived only in working
-memory between reading the batch and writing the table at the end. Nothing was
-careless; there was simply no record. Generating the deliverables from a ledger
-makes that failure structurally impossible instead of a matter of diligence.
+**Build the user table and `fixes.json` directly from Pass B's own output, not
+from a separate note taken while reading.** Each `Workflow` batch already
+returns a structured, schema-validated finding per flagged cue — timestamp,
+verdict (`fix`/`ask`/`dismiss`), fix text, justification — so every cue Pass B
+flagged already has a disposition by construction; there is no free-form
+working-memory step where one could quietly go unrecorded. Aggregate the
+batches' findings arrays, split by verdict, and generate the fixes file and the
+user table from that combined list.
 
 - **Never invent a word to avoid asking.** A confident-looking wrong line is
   worse than a flagged one, because the user will not think to check it.
@@ -1669,7 +1659,6 @@ All under `scripts/`, all take explicit arguments, none hardcode paths.
 | `build_srt.py` | Rebuild cues with real subtitle constraints |
 | `find_suspects.py` | Dictionary check to surface candidate errors |
 | `review_pairs.py` | Draft vs every source, word-level disagreement marking and tiering |
-| `findings.py` | Pass B ledger; generates the user table and fixes file, enforces the balance |
 | `run_canary.py` | Independent second transcript from Canary-1B-v2 on Metal |
 | `run_qwen3.py` | Independent third transcript from Qwen3-ASR-1.7B on Metal |
 | `fix_sentence_breaks.py` | Step 9: find and repair unpunctuated sentence starts |
