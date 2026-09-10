@@ -123,27 +123,41 @@ expect a longer user-review table at the end.
 
 ## Step 5 — Transcribe three times
 
-Split the audio once, on silence, so no cut lands mid-word:
+Split the audio once, on silence, so no cut lands mid-word. Default is 120s
+chunks, not a longer target — see below for why:
 
 ```bash
-python3 scripts/chunk_audio.py audio.wav work/chunks 600   # ~10-min targets
+python3 scripts/chunk_audio.py audio.wav work/chunks    # 120s default
 ```
 
 **Whisper large-v3, Metal:**
 
 ```bash
 uv tool install mlx-whisper
-mlx_whisper work/chunks/cNN.wav \
-  --model mlx-community/whisper-large-v3-mlx --language fr \
-  --condition-on-previous-text False --hallucination-silence-threshold 2 \
-  --output-format srt --output-dir work/srt --output-name cNN
+"$(uv tool dir)/mlx-whisper/bin/python" scripts/run_whisper.py work/chunks work/srt fr
 ```
 
-Those two flags matter, not just tuning — without them, `mlx-whisper` (no
-built-in VAD) falls into repetition loops. Run per-chunk in a loop, skip a
-chunk if its output already exists (cheap resume), then check the combined
-output for repeated lines:
-`grep -vE '^[0-9]+$|-->|^$' work/srt/*.srt | sort | uniq -c | sort -rn | head`
+Two things matter here, not just tuning:
+
+1. **120s chunks, not ~600s.** Whisper's own segment timestamps come from a
+   coarse internal estimate, and a wrong one doesn't get fixed downstream —
+   `align_words.py` (Step 6) only refines word timing *inside* whatever
+   window Whisper proposed; it can't correct the window itself. Measured on a
+   real film: the error does NOT grow with position inside a long chunk
+   (within-chunk correlation ~0, so it isn't cumulative drift), but shorter
+   chunks still shrink the worst-case tail substantially (P90 |timestamp
+   error| dropped from 9.6s to 7.1s in that test, mean/median improved too).
+   Treat 120s as the default, not a per-run decision.
+2. **Load the model once, don't shell out per chunk.** `run_whisper.py` loops
+   in one process — the alternative (invoking the `mlx_whisper` CLI once per
+   chunk) reloads the whole model every time, which is fine at ~11 chunks and
+   expensive at ~50. This is what keeps 120s chunking free instead of ~5x
+   slower.
+3. **The anti-hallucination settings still matter.** Without
+   `condition_on_previous_text=False` and `hallucination_silence_threshold=2`,
+   `mlx-whisper` (no built-in VAD) falls into repetition loops — check the
+   combined output for repeated lines:
+   `grep -vE '^[0-9]+$|-->|^$' work/srt/*.srt | sort | uniq -c | sort -rn | head`
 
 **Canary-1B-v2 and Qwen3-ASR-1.7B, independent second and third opinions:**
 
@@ -501,6 +515,7 @@ Verify the finished file's duration matches the source and the audio track is
 | Script | Purpose |
 |---|---|
 | `chunk_audio.py` | Silence-aligned chunking for the Whisper pass; writes `cuts.txt` |
+| `run_whisper.py` | Whisper large-v3 pass, model loaded once, looped over all chunks |
 | `align_words.py` | wav2vec2 forced alignment for word-level timing |
 | `clamp_durations.py` | Clamp implausible word durations; flags spans that may hide swallowed dialogue |
 | `check_swallowed_spans.py` | Diff every source's content against the draft for a flagged span |
@@ -520,7 +535,7 @@ handful of places every time:
 
 | Where | Note |
 |---|---|
-| `mlx_whisper --language` | ISO-639-1 (`fr`, `en`, ...) |
+| `run_whisper.py` language arg | ISO-639-1 (`fr`, `en`, ...) |
 | `run_canary.py` / `run_qwen3.py` language arg | ISO-639-1; Canary covers 25 European languages, Qwen3-ASR covers 52 |
 | `align_words.py` language arg | picks the wav2vec2 model |
 | `build_srt.py` / `fix_sentence_breaks.py` language arg | punctuation-spacing rules (e.g. French needs a space before `! ? ; :`) |

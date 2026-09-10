@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Split audio into silence-aligned chunks so WhisperX never runs out of memory.
+"""Split audio into silence-aligned chunks for the Whisper pass.
 
     chunk_audio.py <audio.wav> <outdir> [target-seconds]
 
 Boundaries are snapped to detected silences so no cut lands mid-word.
 Writes <outdir>/cNN.wav and <outdir>/cuts.txt (chunk start offsets, seconds).
+
+Default target is 120s, not the ~600s used historically. Measured on a real
+film: Whisper's own segment-timestamp error doesn't grow with elapsed time
+within a chunk (within-chunk position/error correlation ~0), but shorter
+chunks still shrink the worst-case tail meaningfully (P90 |error| 9.6s -> 7.1s
+in that test) at no real compute cost, since `run_whisper.py` loads the model
+once and loops rather than reloading per chunk. Treat 120s as the default,
+not a tunable most runs need to touch.
 """
 import os
 import re
@@ -42,7 +50,7 @@ def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     src, out_dir = sys.argv[1], sys.argv[2]
-    target = float(sys.argv[3]) if len(sys.argv) > 3 else 600.0
+    target = float(sys.argv[3]) if len(sys.argv) > 3 else 120.0
     os.makedirs(out_dir, exist_ok=True)
 
     dur = duration(src)
