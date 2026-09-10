@@ -328,6 +328,11 @@ French in isolation), no single batch has enough context to flag it as wrong
 every glossary name and its phonetically-plausible near-misses in the dub
 language; fix any hit with a single global find-and-replace.
 
+Check each hit's context before sweeping it, though — a character being
+briefly misnamed can be the joke, not an ASR error (confirm against WEB/the
+synopsis). A blanket find-and-replace erases that along with the real
+mishearings.
+
 ### Pass C — hallucination sweep
 
 ```bash
