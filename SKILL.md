@@ -184,8 +184,13 @@ total for a 2-hour film on Metal.
 ```bash
 python3 scripts/align_words.py work/chunks work/srt work/words.json fr
 python3 scripts/clamp_durations.py work/words.json work/chunks/cuts.txt \
-  work/words.json work/suspects.json
+  work/words_clamped.json work/suspects.json
 ```
+
+Keep `work/words.json` (unclamped) and `work/words_clamped.json` (clamped)
+as separate files, not the same path — overwriting the input discards the
+raw pre-clamp durations `suspects.json` already points at, which you'll
+want on hand if a flagged span needs a closer look later.
 
 `align_words.py` needs a WhisperX venv (`uv venv --python 3.12 .venv && uv pip
 install whisperx`), not MLX — it's a separate CTC forward pass over the
@@ -215,7 +220,7 @@ through — build it in Step 7, then come back and run this check before Pass B.
 ## Step 7 — Build the draft
 
 ```bash
-python3 scripts/build_srt.py work/words.json work/chunks/cuts.txt draft.srt fr
+python3 scripts/build_srt.py work/words_clamped.json work/chunks/cuts.txt draft.srt fr
 ```
 
 Rebuilds cues from acoustic word onsets under real subtitle constraints: max
@@ -368,7 +373,7 @@ whichever side is at fault.
 
 ```bash
 python3 scripts/fix_sentence_breaks.py corrected.srt fr --report \
-  --glossary "Name1,Name2,..." --words work/words.json
+  --glossary "Name1,Name2,..." --words work/words_clamped.json
 ```
 
 Rebuilding cues from word onsets loses whisper's own sentence-final
