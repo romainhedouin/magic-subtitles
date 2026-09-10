@@ -6,56 +6,51 @@ with frame-accurate timing.
 ## The problem
 
 Subtitle files for dubbed films are usually translated from the *original*
-script, so they don't match what the voices actually say. Running Whisper over
-the audio fixes the wording but introduces new problems: timings drift by
-seconds, proper nouns come out mangled and inconsistent, and long stretches of
-speech collapse into unreadable 20-second blocks.
+script, so they don't match what the voices actually say. Running Whisper
+over the audio fixes the wording but introduces new problems: timings drift,
+proper nouns come out mangled, and a single Whisper pass has no way to tell
+you when it's confidently wrong.
 
 ## The approach
 
-1. **Transcribe with WhisperX**, which adds forced alignment — a wav2vec2 model
-   pins every *word* to the audio, instead of inferring timestamps from decoder
-   attention. This is what fixes timing drift.
-2. **Rebuild the cues** from those word timings under real subtitle constraints,
-   rather than using whisper's own segment boundaries.
-3. **Correct the transcript against a reference subtitle track extracted from
-   the movie file itself.** Almost every release ships subtitles in the dub
-   language: a real human translation, timecoded to this exact file. Nothing
-   else fixes proper nouns nearly as reliably.
+1. **Transcribe the audio three times, with three unrelated model families** —
+   Whisper `large-v3` (Metal), NVIDIA's Canary-1B-v2, and Qwen3-ASR-1.7B. Where
+   all three agree, the line needs no more thought; where they disagree,
+   that's the audio telling you it's genuinely ambiguous. This is what lets
+   you stop scrutinizing 90%+ of the file.
+2. **Forced-align to word level** with wav2vec2, recovering per-word timing
+   that Whisper's own segment timestamps don't reliably have.
+3. **Rebuild the cues** from those word timings under real subtitle
+   constraints, rather than trusting Whisper's own segment boundaries.
+4. **Correct the transcript against a subtitle found for the film** — a real
+   human translation. It's a *semantic parallel text*, not ground truth to
+   copy from: in a reference run only ~54% of words overlapped the dub's
+   actual wording. It's used to work out what a garbled word must have been
+   and to fix proper-noun spelling, never to overwrite the dub's phrasing.
+5. **Hand what's left to the user.** Some lines survive three independent
+   ASR passes and a human-translation cross-check and are still wrong — not
+   every error is recoverable from text alone. The skill reports what it
+   couldn't verify, with its best guess and the evidence, rather than
+   guessing silently.
 
-The reference is a *semantic parallel text*, not ground truth to copy from. The
-two translations typically differ substantially in wording — in the reference
-run, only ~54% of words overlapped. It's used to work out what a garbled word
-must have been, never to overwrite the dub's phrasing.
+See [SKILL.md](SKILL.md) for the full process and `scripts/` for the tooling.
 
 ## Usage
 
-Invoke the skill and answer three questions: which Whisper model (quality vs.
-time), which language, and whether to embed the subtitles into the video.
-
-See [SKILL.md](SKILL.md) for the full process, and `scripts/` for the tooling.
+Invoke the skill and answer three questions: the dub's language, whether you
+already have a reference subtitle (it searches either way), and whether to
+just deliver the `.srt`, soft-mux it, or hard-burn it into the picture.
 
 ## Requirements
 
 ```bash
-brew install ffmpeg tesseract tesseract-lang hunspell
-uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install whisperx
+brew install ffmpeg
+uv tool install mlx-whisper      # transcription, Metal
+uv tool install mlx-audio        # Canary + Qwen3-ASR, Metal
+uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install whisperx  # word alignment
 ```
 
-## Results from the reference run
-
-A 88-minute animated film, French dub, on an M4 Mac:
-
-| | |
-|---|---|
-| Output | 769 cues, 0 overlaps, median 2.3s / 16.9 CPS |
-| Timing | word-level forced alignment, sub-second boundaries |
-| Coverage | 96% of reference dialogue moments |
-| Corrections | 54 cues fixed against the reference, 0 timestamps altered |
-
-Weakest area: musical numbers, where sung vocals defeat voice-activity
-detection and the two translations diverge most, so fewer errors can be
-confirmed. The skill reports what it could not verify rather than guessing.
+Apple Silicon only, for the Metal-accelerated passes.
 
 ## Development
 

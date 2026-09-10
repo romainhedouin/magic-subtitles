@@ -77,7 +77,6 @@ word period is wrong in a song exactly as much as in dialogue.
 import argparse
 import json
 import re
-import sys
 
 SPACE_BEFORE = {'fr'}          # languages putting a space before ! ? ; :
 CAP = r"[A-ZÀ-ÂÄ-ÏÑ-ÖÙ-Ý]"

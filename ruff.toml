@@ -8,5 +8,4 @@ select = ["E", "F"]
 ignore = [
     "E741",  # short loop names like `l` for a subtitle line read fine here
     "E702",  # a few deliberate one-line statement pairs
-    "E731",  # one lambda assignment in pgs_to_srt.py
 ]

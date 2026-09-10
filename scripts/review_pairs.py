@@ -178,7 +178,8 @@ def main():
             body = wins[lb][:200] if wins[lb] else '(nothing at this timecode)'
             mark = ''
             if lb in dissent and dissent[lb]:
-                mark = f" <{len(dissent[lb])} word{'s' if len(dissent[lb]) > 1 else ''} unsupported>"
+                n = len(dissent[lb])
+                mark = f" <{n} word{'s' if n > 1 else ''} unsupported>"
             print(f"{'':>9}    {lb:>{width}}| {body}{mark}")
         print()
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Clamp implausible word durations, and flag any that hid real dialogue.
 
-    clamp_durations.py <words.json> <cuts.txt> <out_words.json> <out_suspects.json> [flag_threshold_s]
+    clamp_durations.py <words.json> <cuts.txt> <out_words.json> <out_suspects.json> \
+        [flag_threshold_s]
 
 The aligner can only place words inside the segment window Whisper gave it, so
 a decoder loop or a held vocalization can inflate one word to absorb an entire
