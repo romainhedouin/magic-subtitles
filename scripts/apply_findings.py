@@ -102,7 +102,8 @@ def main():
     groups = {}
     singles = []
     for f in fixes:
-        span = tuple(f['replaces_cues']) if f.get('replaces_cues') else None
+        rc = f.get('replaces_cues')
+        span = (rc[0], rc[-1]) if rc else None  # a single-cue span is [n] -> (n, n)
         if span:
             groups.setdefault(span, []).append(f)
         else:
