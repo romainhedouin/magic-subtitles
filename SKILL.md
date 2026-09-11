@@ -37,7 +37,7 @@ Ask up front, one message:
    reference resolves cases the first can't. See Step 4.
 3. **Deliver just the `.srt`, soft-mux into the container, or hard-burn into
    the picture?** Default is just the `.srt`. Hard-burn is common but always
-   comes *after* the text is settled (Step 12) — it's a lossy, permanent
+   comes *after* the text is settled (Step 14) — it's a lossy, permanent
    re-encode, and re-burning because a line changed costs a whole encode.
 
 Always run Whisper `large-v3` on Metal via `mlx-whisper` — never ask, never
@@ -183,19 +183,79 @@ total for a 2-hour film on Metal.
 
 ```bash
 python3 scripts/align_words.py work/chunks work/srt work/words.json fr
-python3 scripts/clamp_durations.py work/words.json work/chunks/cuts.txt \
-  work/words_clamped.json work/suspects.json
 ```
-
-Keep `work/words.json` (unclamped) and `work/words_clamped.json` (clamped)
-as separate files, not the same path — overwriting the input discards the
-raw pre-clamp durations `suspects.json` already points at, which you'll
-want on hand if a flagged span needs a closer look later.
 
 `align_words.py` needs a WhisperX venv (`uv venv --python 3.12 .venv && uv pip
 install whisperx`), not MLX — it's a separate CTC forward pass over the
 Whisper segments, recovering per-word timing that whisper's own SRT export
-throws away.
+throws away. Each output word also carries a `seg_start`/`seg_end` tag — the
+specific whisperx-internal output window it came from, not just its position
+in the original segment list (whisperx.align() can split one input segment
+into several internally). Step 7's VAD cross-check depends on this tag to
+group words back into their true source window, so keep it if you ever touch
+this script's output format.
+
+Clamping and duration-suspect flagging (`clamp_durations.py`) now happens in
+Step 7, **after** the VAD cross-check, not directly on this raw output —
+keep reading before running it.
+
+---
+
+## Step 7 — Re-anchor words across a real pause (VAD cross-check)
+
+wav2vec2 forced alignment (Step 6) sometimes places a word or short phrase
+several seconds before it's actually spoken. Root cause, confirmed against
+real data: the aligner front-loads a window's recognized words toward
+whichever edge is unconstrained, whenever that window contains a real
+stretch of silence next to the actual speech. Two distinct signatures of this
+are independently detectable and correctable against a separate, audio-only
+VAD pass — see `vad_reanchor.py`'s docstring for the full derivation;
+summary:
+
+- **Detector A — leading silence absorbed into the first word.** The word's
+  own raw duration balloons (already flagged by `clamp_durations.py`'s
+  suspects mechanism) because nothing before it bounds its start. Its END is
+  usually right (anchored by real speech right after it) — only the START is
+  wrong.
+- **Detector B — trailing dead air left unclaimed.** No single word's
+  duration looks wrong, but the whole recognized cluster sits compressed near
+  the window's start, leaving a multi-second gap between the last word's end
+  and the *original Whisper segment's* declared end that no word accounts
+  for. Checked only on the last whisperx output window belonging to that
+  original segment — matched by time overlap, exact-containment-first, never
+  by position (adjacent back-to-back segments caused wrong matches under a
+  naive tolerance-based match; fixed).
+
+```bash
+uv pip install silero-vad   # CPU-only, no GPU needed; shares the whisperx venv
+
+python3 scripts/detect_vad_regions.py audio.wav work/vad_regions.json
+python3 scripts/vad_reanchor.py work/words.json work/srt work/chunks/cuts.txt \
+  work/vad_regions.json work/words_reanchored.json
+```
+
+`detect_vad_regions.py` runs Silero VAD once over the whole film's
+`audio.wav` and only needs Step 3's output — it doesn't depend on
+transcription or alignment at all, so it can run any time after Step 3, in
+parallel with Steps 5/6 if useful. It reads the WAV directly with Python's
+`wave` module rather than silero_vad's own `read_audio` — that needs a
+torchaudio sox backend not installed in this environment.
+
+`vad_reanchor.py` groups words by their `seg_start`/`seg_end` tag rather than
+by position, then applies both detectors and writes a re-anchored copy. It
+must run **before** `clamp_durations.py` — Detector A's ratio check needs the
+raw, unclamped durations, so the clamp step now takes the reanchored file as
+input:
+
+```bash
+python3 scripts/clamp_durations.py work/words_reanchored.json work/chunks/cuts.txt \
+  work/words_clamped.json work/suspects.json
+```
+
+Keep `work/words_reanchored.json` (unclamped) and `work/words_clamped.json`
+(clamped) as separate files, not the same path — overwriting the input
+discards the raw pre-clamp durations `suspects.json` already points at,
+which you'll want on hand if a flagged span needs a closer look later.
 
 `clamp_durations.py` fixes the *timing* damage from any word whose duration
 blew up (a stuck decoder loop, or a long segment around a short utterance),
@@ -212,12 +272,48 @@ python3 scripts/check_swallowed_spans.py work/suspects.json draft.srt \
 This prints what every source says happened in that span. If an independent
 source shows several real sentences where your draft has one word or none,
 that's swallowed dialogue — treat the whole span as a reconstruction case in
-Step 8, not a single-word fix. (`draft.srt` doesn't exist yet the first time
-through — build it in Step 7, then come back and run this check before Pass B.)
+Step 9, not a single-word fix. (`draft.srt` doesn't exist yet the first time
+through — build it in Step 8, then come back and run this check before Pass B.)
+
+**Validated on a real feature-length run**, cross-checked against known
+ground truth: corrected timestamps matched an ear-check exactly, word count
+before/after was identical (this only nudges existing words' timing, never
+re-aligns, so nothing is lost or duplicated), and `qa_srt.py` passed before
+and after with no overlaps introduced.
+
+**Known limitations:**
+
+1. **Long, un-split repeated-phrase clusters are unreliable for Detector B.**
+   whisperx doesn't always split a repeated phrase into separate output
+   windows — a phrase repeated several times in a row with no strong
+   internal punctuation can stay as one giant window, while the same phrase
+   broken up by exclamation marks gets split into separate windows
+   (punctuation gives the aligner an internal boundary). Detector B shifts
+   a whole cluster as
+   one rigid block, preserving internal spacing; on a long un-split cluster
+   that shift can overshoot the window's own end and collide with unrelated
+   adjacent content. Treat a Detector B correction on an unusually long
+   cluster as lower-confidence, and visually sanity-check any shift that
+   looks implausibly large before trusting it — same "don't auto-apply the
+   big ones blindly" spirit as the rest of this skill's correction steps.
+2. **A third failure mode exists that neither detector catches.** A Whisper
+   segment can be cold-start-anchored to exactly its own chunk's t=0.000 (no
+   prior context) while still showing a *tight* internal window — words fill
+   it almost completely, so there's no leading-duration anomaly (A) and no
+   trailing dead air (B) to flag. Hit example: a short line opening a new
+   chunk had its declared window filled almost exactly by its own words, yet
+   the true speech was a few seconds later — the VAD region it actually
+   belonged to started a few seconds *before* the chunk boundary,
+   already claimed by the tail of the previous chunk's own (correctly
+   reanchored) content. Not automated; still needs a human catching it by
+   ear, same as before this mechanism existed. A future "Detector C" would
+   check whether a chunk-start-anchored segment's declared start actually
+   coincides with where VAD says speech begins, accounting for the preceding
+   chunk possibly already claiming that region.
 
 ---
 
-## Step 7 — Build the draft
+## Step 8 — Build the draft
 
 ```bash
 python3 scripts/build_srt.py work/words_clamped.json work/chunks/cuts.txt draft.srt fr
@@ -230,7 +326,7 @@ never overlaps.
 
 ---
 
-## Step 8 — Correct the transcript
+## Step 9 — Correct the transcript
 
 This is the step that separates a usable file from a rough one. A dictionary
 check alone only catches errors that spell as non-words — most real ASR
@@ -321,15 +417,15 @@ said — `J'ai bien évité mon surnom` (I successfully *avoided* my nickname)
 read fine to all three passes, but the line is `J'ai bien mérité mon surnom`
 (I've *earned* my nickname) — nonsensical-in-context beats fluent-in-isolation
 as a signal, and only a human catching it while watching resolved this one.
-Expect a few of these to survive even a careful Pass B; that's what Step 10 is
+Expect a few of these to survive even a careful Pass B; that's what Step 12 is
 for.
 
 **A systematic name mishearing can hide from batch review entirely.** If a
-character's dub-kept English name sounds like an unrelated real word in the
-dub language (a Kristoff → Christophe mishearing across 21 separate cues, all
-scattered across different Pass B batches, all reading as perfectly fluent
-French in isolation), no single batch has enough context to flag it as wrong
-— each occurrence looks locally fine. After Pass B, grep the whole file for
+character's dub-kept name sounds like an unrelated real word in the dub
+language, the mishearing can recur across dozens of separate cues, scattered
+across different Pass B batches, every one reading as perfectly fluent text
+in isolation — no single batch has enough context to flag it as wrong, each
+occurrence looks locally fine. After Pass B, grep the whole file for
 every glossary name and its phonetically-plausible near-misses in the dub
 language; fix any hit with a single global find-and-replace.
 
@@ -360,16 +456,16 @@ Aggregate every Pass B batch's findings plus the Pass A/C fixes into one
 `findings.json` before applying (see the script's docstring for the schema —
 it handles single-cue text/retime/drop and multi-cue hallucination-loop
 reconstruction, and splits `ask`-verdict findings into `asks.json` for
-Step 10). It renumbers cues on output.
+Step 12). It renumbers cues on output.
 
-**Re-run `qa_srt.py` (Step 11) immediately after applying.** A `retime` can
+**Re-run `qa_srt.py` (Step 13) immediately after applying.** A `retime` can
 overlap an untouched neighbouring cue that wasn't part of the fix — this is
 expected, not a bug in the script, and needs a manual timing nudge on
 whichever side is at fault.
 
 ---
 
-## Step 9 — Repair sentence boundaries
+## Step 10 — Repair sentence boundaries
 
 ```bash
 python3 scripts/fix_sentence_breaks.py corrected.srt fr --report \
@@ -392,7 +488,34 @@ widen the range slightly and re-check).
 
 ---
 
-## Step 10 — Hand the remainder to the user
+## Step 11 — Punctuation sweep
+
+Regrouping words into cues (Step 8) and Pass A/B/C's wording review don't
+catch every punctuation problem — missing or wrong terminal marks, missing
+commas (direct address, clauses joined by "mais"/"et"), stray/orphaned marks
+left over from a cue split, inconsistent ellipsis (`…` vs `...`).
+
+Batch it the same way as Pass B (Step 9): one agent per ~140-cue range,
+reading every cue in range, flagging only clear-cut issues — never a
+stylistic preference. Skip song/lyric passages entirely; they carry no
+punctuation by convention (same exemption as Step 10). If a batch errors on
+ordinary content, that's the Pass B content-filter false positive — just
+re-run that one batch.
+
+Split findings by confidence before touching anything:
+
+- **High confidence** (mechanical — a stray doubled mark, a missing terminal
+  period on an otherwise-complete sentence, an ellipsis format fix): apply
+  directly.
+- **Low/medium confidence** (a passage has so little punctuation left that
+  fixing it means guessing sentence breaks, not inserting a mark): don't
+  guess. Present the cue numbers, timestamps, and current text to the user
+  for an ear-check, same as any other `ask`-verdict item from Step 12 — a
+  wrong guess here changes what the line says, not just how it's punctuated.
+
+---
+
+## Step 12 — Hand the remainder to the user
 
 Present every `ask`-verdict item from `asks.json` as one table, sorted by
 timestamp, with a best guess where you have one and the sources that produced
@@ -401,14 +524,14 @@ ear beats a confident wrong one they won't think to.
 
 Expect several rounds: the user resolves a batch, and their corrections
 sometimes reveal a fix Pass B made confidently but wrong (see the "every
-source agreed and it was still wrong" note in Step 8) — when that happens,
+source agreed and it was still wrong" note in Step 9) — when that happens,
 show your work: quote what each of the three sources actually said at that
 timestamp, so the user can judge whether your read of the evidence, not just
 the conclusion, was reasonable.
 
 ---
 
-## Step 11 — QA
+## Step 13 — QA
 
 ```bash
 python3 scripts/qa_srt.py fixed.srt web.srt
@@ -426,7 +549,7 @@ captions), usually ALL CAPS, with no spoken counterpart at all.
 
 ---
 
-## Step 12 — Deliver
+## Step 14 — Deliver
 
 Name the file to match the video (`Movie.Name.2024.1080p.fr.srt`) so players
 auto-load it.
@@ -501,13 +624,6 @@ Verify the finished file's duration matches the source and the audio track is
 
 ## Pitfalls
 
-- **Whisper hallucination loops** without the two anti-hallucination flags in
-  Step 5 — check for a line repeated dozens of times.
-- **OOM on a full-length CPU pass** — always chunk; a masked non-zero exit
-  code can hide behind a shell wrapper reporting success.
-- **AC3 5.1 audio plays fine on desktop, silent on Android TV/Chromecast** —
-  always deliver AAC-LC stereo (Step 12); when a user reports missing audio,
-  probe the codec before anything else.
 - **Container corruption can truncate a sequential read silently** — ffmpeg
   exits 0 with a short file. Compare the container's duration against the
   extracted WAV's before trusting either.
@@ -527,6 +643,8 @@ Verify the finished file's duration matches the source and the audio track is
 | `chunk_audio.py` | Silence-aligned chunking for the Whisper pass; writes `cuts.txt` |
 | `run_whisper.py` | Whisper large-v3 pass, model loaded once, looped over all chunks |
 | `align_words.py` | wav2vec2 forced alignment for word-level timing |
+| `detect_vad_regions.py` | Silero VAD pass over the whole film; absolute-time speech regions |
+| `vad_reanchor.py` | Cross-checks word timings against VAD regions; fixes words placed across a real pause |
 | `clamp_durations.py` | Clamp implausible word durations; flags spans that may hide swallowed dialogue |
 | `check_swallowed_spans.py` | Diff every source's content against the draft for a flagged span |
 | `build_srt.py` | Rebuild cues from word timings under real subtitle constraints |
@@ -557,6 +675,7 @@ brew install ffmpeg
 uv tool install mlx-whisper      # Step 5, Metal
 uv tool install mlx-audio        # Step 5, Canary + Qwen3-ASR
 uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install whisperx   # Step 6, wav2vec2
+uv pip install silero-vad   # Step 7, VAD cross-check; CPU-only, shares the whisperx venv
 ```
 
 `mlx-audio` installs its own interpreter and serves both Canary and Qwen3-ASR
@@ -564,7 +683,7 @@ uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install whisp
 `"$(uv tool dir)/mlx-audio/bin/python" scripts/run_canary.py ...`.
 
 `brew install ffmpeg` alone is not enough for hard-burn (no libass); see
-Step 12 for the keg-only `ffmpeg-full` check.
+Step 14 for the keg-only `ffmpeg-full` check.
 
 Both MLX packages need Apple Silicon; each model downloads a few GB on first
 use.

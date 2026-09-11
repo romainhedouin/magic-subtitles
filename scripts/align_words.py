@@ -7,6 +7,17 @@ WhisperX aligns to word level internally but writes SRT using whisper's coarse
 segment boundaries. This runs the wav2vec2 aligner again over the existing
 transcript -- a forward pass only, far cheaper than re-transcribing -- and
 keeps the word timings so cues can be re-segmented properly.
+
+Each output word carries `seg_start`/`seg_end`: the start/end of the specific
+whisperx-internal output segment it came from. whisperx.align() can split one
+input segment into several internally (sentence-final punctuation, mostly) --
+measured on real data, one chunk went from 32 input segments to 37 output
+ones -- so a word's *positional* index into the original SRT's segment list
+does not reliably identify which alignment window produced it. Its own
+enclosing output segment's start/end, read directly from whisperx's result,
+does not have this problem. This costs nothing and changes no existing
+timing, but lets a downstream pass (vad_reanchor.py) group words back into
+their true source window without re-deriving or re-matching anything.
 """
 import gc
 import json
@@ -63,7 +74,8 @@ def main():
         res = whisperx.align(segs, model_a, meta, audio, device,
                              return_char_alignments=False)
         # timings come back as numpy floats, which json cannot serialise
-        out[b] = [{'word': w['word'], 'start': float(w['start']), 'end': float(w['end'])}
+        out[b] = [{'word': w['word'], 'start': float(w['start']), 'end': float(w['end']),
+                   'seg_start': float(s['start']), 'seg_end': float(s['end'])}
                   for s in res['segments'] for w in s.get('words', [])
                   if 'start' in w and 'end' in w]
         print(f'{b}: {len(segs)} segs -> {len(out[b])} words', flush=True)
